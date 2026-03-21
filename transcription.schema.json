@@ -5,6 +5,20 @@
   "type": "object",
   "required": ["transcription", "confidence_score", "confidence_label", "model"],
   "additionalProperties": false,
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "confidence_label": {
+            "enum": ["low", "medium"]
+          }
+        }
+      },
+      "then": {
+        "required": ["notes"]
+      }
+    }
+  ],
   "properties": {
     "transcription": {
       "type": "string",
@@ -31,7 +45,8 @@
     },
     "notes": {
       "type": "string",
-      "description": "Optional notes"
+      "minLength": 1,
+      "description": "Model rationale for confidence score"
     }
   }
 }

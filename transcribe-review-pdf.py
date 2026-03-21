@@ -21,6 +21,17 @@ def load_schema() -> dict:
         return json.load(schema_file)
 
 
+def build_response_format(schema: dict) -> dict:
+    return {
+        'type': 'json_schema',
+        'json_schema': {
+            'name': 'idp_transcription_response',
+            'schema': schema,
+            'strict': True,
+        },
+    }
+
+
 def strip_json_code_fence(content: str) -> str:
     text = content.strip()
     if text.startswith('```'):
@@ -54,9 +65,12 @@ def resolve_review_pdf(working_dir: Path, review_pdf_filename: str) -> Path:
 
 def build_messages(prompt_text: str, base64_url: str) -> list[dict]:
     instruction = (
-        'Transcribe this review PDF to markdown. Preserve structure and formatting. '
-        'Respond with JSON only and include keys: transcription, confidence_score, '
-        'confidence_label, and optional notes.'
+        'Transcribe this review PDF to markdown and respond with JSON only. '
+        'Use this key order: confidence_score, confidence_label, notes, transcription. '
+        "confidence_score must be a number from 0.0 to 1.0. "
+        "confidence_label must be one of: 'low', 'medium', 'high'. "
+        'Always include notes explaining the confidence score, including uncertainty '
+        'sources when confidence is not high. Preserve structure and formatting.'
     )
 
     return [
@@ -73,7 +87,8 @@ def build_messages(prompt_text: str, base64_url: str) -> list[dict]:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description='Transcribe one review PDF via Gemini/LiteLLM.'
+        description='Transcribe one review PDF via Gemini/LiteLLM.',
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     parser.add_argument(
         '--review-pdf',
@@ -83,25 +98,25 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         '--prompt-md',
         type=Path,
-        required=True,
-        help='Path to prompt markdown file.',
+        default=None,
+        help='Optional path to prompt markdown file.',
     )
     parser.add_argument(
         '--working-dir',
         type=Path,
         default=Path('.'),
-        help='Working directory containing review-pdfs/ and transcriptions/.',
+        help='Optional working directory containing review-pdfs/ and transcriptions/.',
     )
     parser.add_argument(
         '--model',
         default=os.environ.get('IDP_MODEL', DEFAULT_MODEL),
-        help='LiteLLM model string.',
+        help='Optional LiteLLM model string.',
     )
     parser.add_argument(
         '--temperature',
         type=float,
         default=0.0,
-        help='Sampling temperature.',
+        help='Optional sampling temperature.',
     )
     parser.add_argument(
         '--out-json',
@@ -112,38 +127,18 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def normalize_confidence_label(label: object, score: object) -> str:
-    if isinstance(label, str):
-        normalized = re.sub(r'[^a-z]', '', label.lower())
-        if normalized in {'low', 'medium', 'high'}:
-            return normalized
-        if normalized in {'verylow', 'lowconfidence'}:
-            return 'low'
-        if normalized in {'moderate', 'mediumconfidence'}:
-            return 'medium'
-        if normalized in {'veryhigh', 'highconfidence'}:
-            return 'high'
-
-    if isinstance(score, (int, float)):
-        if score < 0.34:
-            return 'low'
-        if score < 0.67:
-            return 'medium'
-        return 'high'
-
-    return 'medium'
-
-
 def main() -> int:
     args = parse_args()
     working_dir = args.working_dir.resolve()
+    prompt_md = args.prompt_md if args.prompt_md is not None else working_dir / 'prompt.md'
+    schema = load_schema()
 
     if not os.environ.get('GEMINI_API_KEY'):
         print('Error: GEMINI_API_KEY environment variable is not set.', file=sys.stderr)
         return 2
 
-    if not args.prompt_md.exists():
-        print(f'Error: Prompt file not found: {args.prompt_md}', file=sys.stderr)
+    if not prompt_md.exists():
+        print(f'Error: Prompt file not found: {prompt_md}', file=sys.stderr)
         return 2
 
     try:
@@ -152,7 +147,7 @@ def main() -> int:
         print(f'Error: {exc}', file=sys.stderr)
         return 2
 
-    prompt_text = args.prompt_md.read_text(encoding='utf-8')
+    prompt_text = prompt_md.read_text(encoding='utf-8')
     encoded_pdf = base64.b64encode(review_pdf_path.read_bytes()).decode('utf-8')
     pdf_data_url = f'data:application/pdf;base64,{encoded_pdf}'
 
@@ -161,6 +156,7 @@ def main() -> int:
             model=args.model,
             messages=build_messages(prompt_text, pdf_data_url),
             temperature=args.temperature,
+            response_format=build_response_format(schema),
         )
     except Exception as exc:
         print(f'LiteLLM request failed: {exc}', file=sys.stderr)
@@ -174,20 +170,16 @@ def main() -> int:
         return 1
 
     payload = {
-        'transcription': raw.get('transcription', ''),
-        'confidence_score': raw.get('confidence_score', 0.0),
-        'confidence_label': normalize_confidence_label(
-            raw.get('confidence_label'),
-            raw.get('confidence_score', 0.0),
-        ),
+        'confidence_score': raw.get('confidence_score'),
+        'confidence_label': raw.get('confidence_label'),
+        'notes': raw.get('notes'),
+        'transcription': raw.get('transcription'),
         'model': args.model,
         'configuration': f'temperature={args.temperature}, detail=high',
     }
-    if isinstance(raw.get('notes'), str) and raw['notes'].strip():
-        payload['notes'] = raw['notes'].strip()
 
     try:
-        jsonschema.validate(instance=payload, schema=load_schema())
+        jsonschema.validate(instance=payload, schema=schema)
     except jsonschema.ValidationError as exc:
         print(f'Schema validation failed: {exc}', file=sys.stderr)
         return 1
