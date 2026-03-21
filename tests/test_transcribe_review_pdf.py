@@ -87,12 +87,12 @@ def test_live_integration_transcribes_review_pdf():
         pytest.skip('GEMINI_API_KEY is not set; skipping live integration test.')
 
     ensure_review_pdf_exists()
-    out_json = WORKING_DIR / 'transcriptions' / 'test-a_001-003.response.json'
     out_md = WORKING_DIR / 'transcriptions' / 'test-a_001-003.md'
-    if out_json.exists():
-        out_json.unlink()
+    out_ai_log_md = WORKING_DIR / 'transcriptions' / 'test-a_001-003-ai-log.md'
     if out_md.exists():
         out_md.unlink()
+    if out_ai_log_md.exists():
+        out_ai_log_md.unlink()
 
     result = run_cli(
         [
@@ -102,13 +102,17 @@ def test_live_integration_transcribes_review_pdf():
             'test-a_001-003.pdf',
             '--prompt-md',
             str(PROMPT_PATH),
-            '--out-json',
-            str(out_json),
         ],
         env=dict(os.environ),
     )
 
     assert result.returncode == 0, result.stderr
     assert out_md.exists()
-    assert out_json.exists()
+    assert out_ai_log_md.exists()
     assert out_md.read_text(encoding='utf-8').strip() != ''
+    ai_log_text = out_ai_log_md.read_text(encoding='utf-8')
+    assert 'Review PDF file: `test-a_001-003.pdf`' in ai_log_text
+    assert '- Model: `' in ai_log_text
+    assert '- Confidence score: `' in ai_log_text
+    assert '- Confidence label: `' in ai_log_text
+    assert '## Prompt used' in ai_log_text

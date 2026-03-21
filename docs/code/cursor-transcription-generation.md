@@ -1,6 +1,6 @@
 ---
 name: litellm-review-transcriber
-overview: Add a single integration-friendly CLI script that transcribes one review PDF via Gemini/LiteLLM using a provided prompt markdown file, validates JSON response against schema, and writes markdown output to transcriptions/.
+overview: Add a single integration-friendly CLI script that transcribes one review PDF via Gemini/LiteLLM using a provided prompt markdown file, validates JSON response against schema, and writes markdown output plus an AI run log to transcriptions/.
 todos:
   - id: add-transcribe-cli
     content: Implement transcribe-review-pdf.py with LiteLLM Gemini call, schema validation, and markdown output write.
@@ -50,7 +50,6 @@ Primary arguments:
 - `--working-dir <path>` (default `.`)
 - `--model <provider/model>` (default `gemini/gemini-2.5-flash`)
 - `--temperature <float>` (default `0.0`)
-- `--out-json <path>` (optional debug artifact for validated full JSON)
 
 Environment:
 
@@ -65,13 +64,14 @@ Environment:
 - Build payload with required schema keys (`transcription`, `confidence_score`, `confidence_label`, `model`; optional `notes`, `configuration`) and validate with JSON Schema.
 - Ensure output dir `transcriptions/` exists.
 - Write markdown transcription to `transcriptions/<stem>.md`.
+- Write reproducibility log to `transcriptions/<stem>-ai-log.md` including review PDF filename, model, configuration, confidence score, confidence label, notes, and prompt used.
 
 ## Testing approach
 
 Create true integration tests that pass CLI args and call Gemini through LiteLLM:
 
 - live success path writes markdown file with expected filename/content
-- optional check for JSON artifact via `--out-json` (when enabled)
+- live success path writes run log markdown with required reproducibility fields
 - missing `GEMINI_API_KEY` returns clear error
 - invalid `review-pdfs` filename/path handling
 - if `GEMINI_API_KEY` is not set in CI/local environment, mark live integration tests as skipped with clear reason

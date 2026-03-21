@@ -58,7 +58,8 @@ pytest -q
 ## Transcribe a review PDF
 
 Use Gemini through LiteLLM to transcribe a file from `review-pdfs/` into
-`transcriptions/<review_pdf_stem>.md`.
+`transcriptions/<review_pdf_stem>.md`, and write a reproducibility log to
+`transcriptions/<review_pdf_stem>-ai-log.md`.
 
 ```bash
 export GEMINI_API_KEY=...
@@ -74,7 +75,26 @@ Notes:
   - if exactly one file matches, it is used automatically
   - if multiple files match, you can choose interactively with up/down arrows
   - if none match, the script exits with an error
-- `--out-json <path>` optionally saves validated full JSON response.
+- `<review_pdf_stem>-ai-log.md` includes: review PDF filename, model, configuration, confidence score, confidence label, notes, and full prompt used.
+
+Example `-ai-log.md`:
+
+```markdown
+# AI transcription run log
+
+- Review PDF file: `test-a_001-003.pdf`
+- Model: `gemini/gemini-2.5-flash`
+- Configuration: `temperature=0.0, detail=high`
+- Confidence score: `0.93`
+- Confidence label: `high`
+- Notes: Clear text with minor uncertainty around one table heading.
+
+## Prompt used
+
+````markdown
+<!-- full prompt text captured verbatim -->
+````
+```
 
 Live integration test:
 

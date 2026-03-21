@@ -254,12 +254,6 @@ def parse_args() -> argparse.Namespace:
         default=0.0,
         help='Optional sampling temperature.',
     )
-    parser.add_argument(
-        '--out-json',
-        type=Path,
-        default=None,
-        help='Optional file path to save validated JSON payload.',
-    )
     return parser.parse_args()
 
 
@@ -275,6 +269,34 @@ def normalize_transcription_newlines(transcription: object) -> str:
             .replace('\\r', '\n')
         )
     return normalized
+
+
+def build_ai_log_markdown(
+    review_pdf_filename: str,
+    model: str,
+    configuration: str,
+    confidence_score: object,
+    confidence_label: object,
+    notes: object,
+    prompt_text: str,
+) -> str:
+    confidence_score_text = '' if confidence_score is None else str(confidence_score)
+    confidence_label_text = '' if confidence_label is None else str(confidence_label)
+    notes_text = '' if notes is None else str(notes)
+
+    return (
+        '# AI transcription run log\n\n'
+        f'- Review PDF file: `{review_pdf_filename}`\n'
+        f'- Model: `{model}`\n'
+        f'- Configuration: `{configuration}`\n'
+        f'- Confidence score: `{confidence_score_text}`\n'
+        f'- Confidence label: `{confidence_label_text}`\n'
+        f'- Notes: {notes_text}\n\n'
+        '## Prompt used\n\n'
+        '````markdown\n'
+        f'{prompt_text}\n'
+        '````\n'
+    )
 
 
 def main() -> int:
@@ -353,16 +375,23 @@ def main() -> int:
     transcriptions_dir = working_dir / 'transcriptions'
     transcriptions_dir.mkdir(parents=True, exist_ok=True)
     output_md = transcriptions_dir / f'{review_pdf_path.stem}.md'
+    output_ai_log_md = transcriptions_dir / f'{review_pdf_path.stem}-ai-log.md'
     output_md.write_text(payload['transcription'], encoding='utf-8')
-
-    if args.out_json:
-        args.out_json.parent.mkdir(parents=True, exist_ok=True)
-        args.out_json.write_text(
-            json.dumps(payload, indent=2, ensure_ascii=True) + '\n',
-            encoding='utf-8',
-        )
+    output_ai_log_md.write_text(
+        build_ai_log_markdown(
+            review_pdf_filename=review_pdf_path.name,
+            model=args.model,
+            configuration=payload['configuration'],
+            confidence_score=payload['confidence_score'],
+            confidence_label=payload['confidence_label'],
+            notes=payload['notes'],
+            prompt_text=prompt_text,
+        ),
+        encoding='utf-8',
+    )
 
     print(f'Created transcription: {output_md}')
+    print(f'Created AI log: {output_ai_log_md}')
     return 0
 
 
