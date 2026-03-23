@@ -108,24 +108,24 @@ def test_config_path_resolution_prefers_working_dir(tmp_path: Path):
     write_config(
         script_config_path,
         '{"model":"gemini/gemini-2.5-flash","temperature":0.0,'
-        '"reasoning_effort":"high","detail":"high"}',
+        '"reasoning_effort":"high","media_resolution":"high"}',
     )
     write_config(
         working_config_path,
         '{"model":"gemini/gemini-2.5-flash","temperature":0.3,'
-        '"reasoning_effort":"medium","detail":"low"}',
+        '"reasoning_effort":"medium","media_resolution":"low"}',
     )
     resolved = module.resolve_transcribe_config_path(working_dir)
     assert resolved == working_config_path
 
 
-def test_invalid_config_detail_rejected(tmp_path: Path):
+def test_invalid_config_media_resolution_rejected(tmp_path: Path):
     module = load_transcribe_module()
     config_path = tmp_path / 'transcribe.config.json'
     write_config(
         config_path,
         '{"model":"gemini/gemini-2.5-flash","temperature":0.0,'
-        '"reasoning_effort":"high","detail":"invalid"}',
+        '"reasoning_effort":"high","media_resolution":"invalid"}',
     )
 
     with pytest.raises(ValueError, match='Invalid config file'):
@@ -164,7 +164,10 @@ def test_live_integration_transcribes_review_pdf():
     ai_log_text = out_ai_log_md.read_text(encoding='utf-8')
     assert 'Review PDF file: `test-a_001-003.pdf`' in ai_log_text
     assert '- Model: `' in ai_log_text
-    assert '- Configuration: `temperature=0.0, detail=high, reasoning_effort=high`' in ai_log_text
+    assert (
+        '- Configuration: '
+        '`temperature=0.0, media_resolution=high, reasoning_effort=high`'
+    ) in ai_log_text
     assert '- Confidence score: `' in ai_log_text
     assert '- Confidence label: `' in ai_log_text
     assert '## Prompt used' in ai_log_text

@@ -21,7 +21,7 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 SCHEMA_PATH = SCRIPT_DIR / 'transcription.schema.json'
 TRANSCRIBE_CONFIG_FILENAME = 'transcribe.config.json'
 VALID_REASONING_EFFORTS = ('none', 'disable', 'low', 'medium', 'high', 'minimal')
-VALID_DETAIL_LEVELS = ('low', 'medium', 'high', 'ultra_high', 'auto')
+VALID_MEDIA_RESOLUTIONS = ('low', 'medium', 'high', 'ultra_high', 'auto')
 
 
 def load_schema() -> dict:
@@ -201,7 +201,7 @@ def resolve_prompt_md(working_dir: Path) -> Path:
     return working_dir / selected_name
 
 
-def build_messages(prompt_text: str, base64_url: str, detail: str) -> list[dict]:
+def build_messages(prompt_text: str, base64_url: str, media_resolution: str) -> list[dict]:
     instruction = (
         'Transcribe this review PDF to markdown and respond with JSON only. '
         'Use this key order: confidence_score, confidence_label, notes, transcription. '
@@ -217,7 +217,12 @@ def build_messages(prompt_text: str, base64_url: str, detail: str) -> list[dict]
             'content': [
                 {'type': 'text', 'text': instruction},
                 {'type': 'text', 'text': prompt_text},
-                {'type': 'file', 'file': {'file_data': base64_url, 'detail': detail}},
+                # LiteLLM/OpenAI-style multimodal content uses the field name `detail`.
+                # We expose this as `media_resolution` in config for clarity.
+                {
+                    'type': 'file',
+                    'file': {'file_data': base64_url, 'detail': media_resolution},
+                },
             ],
         }
     ]
@@ -274,7 +279,12 @@ def load_transcribe_config(config_path: Path) -> dict:
         choices=VALID_REASONING_EFFORTS,
         required=True,
     )
-    parser.add_argument('--detail', type=str, choices=VALID_DETAIL_LEVELS, required=True)
+    parser.add_argument(
+        '--media_resolution',
+        type=str,
+        choices=VALID_MEDIA_RESOLUTIONS,
+        required=True,
+    )
 
     try:
         config_data = json.loads(config_path.read_text(encoding='utf-8'))
@@ -290,7 +300,7 @@ def load_transcribe_config(config_path: Path) -> dict:
         'model': parsed.model,
         'temperature': parsed.temperature,
         'reasoning_effort': parsed.reasoning_effort,
-        'detail': parsed.detail,
+        'media_resolution': parsed.media_resolution,
     }
 
 
@@ -387,7 +397,11 @@ def main() -> int:
     try:
         response = completion(
             model=transcribe_config['model'],
-            messages=build_messages(prompt_text, pdf_data_url, transcribe_config['detail']),
+            messages=build_messages(
+                prompt_text,
+                pdf_data_url,
+                transcribe_config['media_resolution'],
+            ),
             temperature=transcribe_config['temperature'],
             reasoning_effort=transcribe_config['reasoning_effort'],
             response_format=build_response_format(schema),
@@ -411,7 +425,7 @@ def main() -> int:
         'model': transcribe_config['model'],
         'configuration': (
             f'temperature={transcribe_config["temperature"]}, '
-            f'detail={transcribe_config["detail"]}, '
+            f'media_resolution={transcribe_config["media_resolution"]}, '
             f'reasoning_effort={transcribe_config["reasoning_effort"]}'
         ),
     }
@@ -430,7 +444,7 @@ def main() -> int:
     output_ai_log_md.write_text(
         build_ai_log_markdown(
             review_pdf_filename=review_pdf_path.name,
-            model=args.model,
+            model=transcribe_config['model'],
             configuration=payload['configuration'],
             confidence_score=payload['confidence_score'],
             confidence_label=payload['confidence_label'],

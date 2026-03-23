@@ -2,5 +2,5 @@
   "model": "gemini/gemini-2.5-flash",
   "temperature": 0.0,
   "reasoning_effort": "high",
-  "detail": "high"
+  "media_resolution": "high"
 }

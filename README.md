@@ -88,7 +88,7 @@ Example `-ai-log.md`:
 
 - Review PDF file: `test-a_001-003.pdf`
 - Model: `gemini/gemini-2.5-flash`
-- Configuration: `temperature=0.0, detail=high, reasoning_effort=high`
+- Configuration: `temperature=0.0, media_resolution=high, reasoning_effort=high`
 - Confidence score: `0.93`
 - Confidence label: `high`
 - Notes: Clear text with minor uncertainty around one table heading.
@@ -113,6 +113,6 @@ Example `transcribe.config.json`:
   "model": "gemini/gemini-2.5-flash",
   "temperature": 0.0,
   "reasoning_effort": "high",
-  "detail": "high"
+  "media_resolution": "high"
 }
 ```
