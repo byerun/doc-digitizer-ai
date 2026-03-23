@@ -1,6 +1,7 @@
 import os
 import subprocess
 import sys
+from importlib.util import module_from_spec, spec_from_file_location
 from pathlib import Path
 
 import pytest
@@ -12,6 +13,15 @@ SCRIPT_PATH = PROJECT_ROOT / 'transcribe-review-pdf.py'
 PROMPT_PATH = WORKING_DIR / 'prompt.md'
 
 
+def load_transcribe_module():
+    spec = spec_from_file_location('transcribe_review_pdf', SCRIPT_PATH)
+    if spec is None or spec.loader is None:
+        raise RuntimeError(f'Unable to load module from {SCRIPT_PATH}')
+    module = module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
 def run_cli(args: list[str], env: dict | None = None) -> subprocess.CompletedProcess:
     command = [sys.executable, str(SCRIPT_PATH), *args]
     return subprocess.run(
@@ -21,6 +31,10 @@ def run_cli(args: list[str], env: dict | None = None) -> subprocess.CompletedPro
         env=env,
         check=False,
     )
+
+
+def write_config(path: Path, content: str):
+    path.write_text(content, encoding='utf-8')
 
 
 def ensure_review_pdf_exists():
@@ -81,6 +95,43 @@ def test_invalid_review_pdf_path_input_rejected():
         assert 'filename, not a path' in result.stderr
 
 
+def test_config_path_resolution_prefers_working_dir(tmp_path: Path):
+    module = load_transcribe_module()
+    working_dir = tmp_path / 'working'
+    script_dir = tmp_path / 'script'
+    working_dir.mkdir(parents=True, exist_ok=True)
+    script_dir.mkdir(parents=True, exist_ok=True)
+    module.SCRIPT_DIR = script_dir
+    script_config_path = script_dir / module.TRANSCRIBE_CONFIG_FILENAME
+    working_config_path = working_dir / module.TRANSCRIBE_CONFIG_FILENAME
+
+    write_config(
+        script_config_path,
+        '{"model":"gemini/gemini-2.5-flash","temperature":0.0,'
+        '"reasoning_effort":"high","detail":"high"}',
+    )
+    write_config(
+        working_config_path,
+        '{"model":"gemini/gemini-2.5-flash","temperature":0.3,'
+        '"reasoning_effort":"medium","detail":"low"}',
+    )
+    resolved = module.resolve_transcribe_config_path(working_dir)
+    assert resolved == working_config_path
+
+
+def test_invalid_config_detail_rejected(tmp_path: Path):
+    module = load_transcribe_module()
+    config_path = tmp_path / 'transcribe.config.json'
+    write_config(
+        config_path,
+        '{"model":"gemini/gemini-2.5-flash","temperature":0.0,'
+        '"reasoning_effort":"high","detail":"invalid"}',
+    )
+
+    with pytest.raises(ValueError, match='Invalid config file'):
+        module.load_transcribe_config(config_path)
+
+
 @pytest.mark.integration
 def test_live_integration_transcribes_review_pdf():
     if not os.environ.get('GEMINI_API_KEY'):
@@ -113,6 +164,7 @@ def test_live_integration_transcribes_review_pdf():
     ai_log_text = out_ai_log_md.read_text(encoding='utf-8')
     assert 'Review PDF file: `test-a_001-003.pdf`' in ai_log_text
     assert '- Model: `' in ai_log_text
+    assert '- Configuration: `temperature=0.0, detail=high, reasoning_effort=high`' in ai_log_text
     assert '- Confidence score: `' in ai_log_text
     assert '- Confidence label: `' in ai_log_text
     assert '## Prompt used' in ai_log_text

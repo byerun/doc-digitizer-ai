@@ -12,13 +12,16 @@ import tty
 from pathlib import Path
 
 import jsonschema
+from jsonargparse import ArgumentParser as JsonArgParser
 from litellm import completion
 
 from review_pdf_generator import ReviewPdfGenerator
 
-DEFAULT_MODEL = 'gemini/gemini-2.5-flash'
 SCRIPT_DIR = Path(__file__).resolve().parent
 SCHEMA_PATH = SCRIPT_DIR / 'transcription.schema.json'
+TRANSCRIBE_CONFIG_FILENAME = 'transcribe.config.json'
+VALID_REASONING_EFFORTS = ('none', 'disable', 'low', 'medium', 'high', 'minimal')
+VALID_DETAIL_LEVELS = ('low', 'medium', 'high', 'ultra_high', 'auto')
 
 
 def load_schema() -> dict:
@@ -198,7 +201,7 @@ def resolve_prompt_md(working_dir: Path) -> Path:
     return working_dir / selected_name
 
 
-def build_messages(prompt_text: str, base64_url: str) -> list[dict]:
+def build_messages(prompt_text: str, base64_url: str, detail: str) -> list[dict]:
     instruction = (
         'Transcribe this review PDF to markdown and respond with JSON only. '
         'Use this key order: confidence_score, confidence_label, notes, transcription. '
@@ -214,7 +217,7 @@ def build_messages(prompt_text: str, base64_url: str) -> list[dict]:
             'content': [
                 {'type': 'text', 'text': instruction},
                 {'type': 'text', 'text': prompt_text},
-                {'type': 'file', 'file': {'file_data': base64_url, 'detail': 'high'}},
+                {'type': 'file', 'file': {'file_data': base64_url, 'detail': detail}},
             ],
         }
     ]
@@ -243,18 +246,52 @@ def parse_args() -> argparse.Namespace:
         default=Path('.'),
         help='Optional working directory containing review-pdfs/ and transcriptions/.',
     )
-    parser.add_argument(
-        '--model',
-        default=os.environ.get('IDP_MODEL', DEFAULT_MODEL),
-        help='Optional LiteLLM model string.',
-    )
-    parser.add_argument(
-        '--temperature',
-        type=float,
-        default=0.0,
-        help='Optional sampling temperature.',
-    )
     return parser.parse_args()
+
+
+def resolve_transcribe_config_path(working_dir: Path) -> Path:
+    working_dir_config = working_dir / TRANSCRIBE_CONFIG_FILENAME
+    if working_dir_config.exists():
+        return working_dir_config
+
+    script_dir_config = SCRIPT_DIR / TRANSCRIBE_CONFIG_FILENAME
+    if script_dir_config.exists():
+        return script_dir_config
+
+    raise ValueError(
+        f'Missing transcribe config file: expected {working_dir_config} '
+        f'or {script_dir_config}'
+    )
+
+
+def load_transcribe_config(config_path: Path) -> dict:
+    parser = JsonArgParser(exit_on_error=False)
+    parser.add_argument('--model', type=str, required=True)
+    parser.add_argument('--temperature', type=float, required=True)
+    parser.add_argument(
+        '--reasoning_effort',
+        type=str,
+        choices=VALID_REASONING_EFFORTS,
+        required=True,
+    )
+    parser.add_argument('--detail', type=str, choices=VALID_DETAIL_LEVELS, required=True)
+
+    try:
+        config_data = json.loads(config_path.read_text(encoding='utf-8'))
+    except Exception as exc:
+        raise ValueError(f'Could not read config file {config_path}: {exc}') from exc
+
+    try:
+        parsed = parser.parse_object(config_data)
+    except Exception as exc:
+        raise ValueError(f'Invalid config file {config_path}: {exc}') from exc
+
+    return {
+        'model': parsed.model,
+        'temperature': parsed.temperature,
+        'reasoning_effort': parsed.reasoning_effort,
+        'detail': parsed.detail,
+    }
 
 
 def normalize_transcription_newlines(transcription: object) -> str:
@@ -304,6 +341,13 @@ def main() -> int:
     working_dir = args.working_dir.resolve()
     schema = load_schema()
 
+    try:
+        config_path = resolve_transcribe_config_path(working_dir)
+        transcribe_config = load_transcribe_config(config_path)
+    except ValueError as exc:
+        print(f'Error: {exc}', file=sys.stderr)
+        return 2
+
     if not os.environ.get('GEMINI_API_KEY'):
         print('Error: GEMINI_API_KEY environment variable is not set.', file=sys.stderr)
         return 2
@@ -335,16 +379,17 @@ def main() -> int:
     encoded_pdf = base64.b64encode(review_pdf_path.read_bytes()).decode('utf-8')
     pdf_data_url = f'data:application/pdf;base64,{encoded_pdf}'
     print(
-        f'Transcribing {review_pdf_path.name} with {args.model}; this can take a while...',
+        f'Transcribing {review_pdf_path.name} with {transcribe_config["model"]}; '
+        'this can take a while...',
         flush=True,
     )
 
     try:
         response = completion(
-            model=args.model,
-            messages=build_messages(prompt_text, pdf_data_url),
-            temperature=args.temperature,
-            reasoning_effort='high',
+            model=transcribe_config['model'],
+            messages=build_messages(prompt_text, pdf_data_url, transcribe_config['detail']),
+            temperature=transcribe_config['temperature'],
+            reasoning_effort=transcribe_config['reasoning_effort'],
             response_format=build_response_format(schema),
         )
     except Exception as exc:
@@ -363,9 +408,11 @@ def main() -> int:
         'confidence_label': raw.get('confidence_label'),
         'notes': raw.get('notes'),
         'transcription': normalize_transcription_newlines(raw.get('transcription', '')),
-        'model': args.model,
+        'model': transcribe_config['model'],
         'configuration': (
-            f'temperature={args.temperature}, detail=high, reasoning_effort=high'
+            f'temperature={transcribe_config["temperature"]}, '
+            f'detail={transcribe_config["detail"]}, '
+            f'reasoning_effort={transcribe_config["reasoning_effort"]}'
         ),
     }
 

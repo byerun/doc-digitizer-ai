@@ -69,6 +69,10 @@ python transcribe-review-pdf.py \
 
 Notes:
 - `transcriptions/` is created automatically if it does not exist.
+- Model settings are read from `transcribe.config.json` with this precedence:
+  - `<working-dir>/transcribe.config.json`
+  - `<script-dir>/transcribe.config.json` (fallback)
+- `--config` is not required.
 - `--review-pdf` is optional. If omitted, the script prompts you to choose from `review-pdfs/` with up/down arrows. The default selection comes from `.review-chunk-state.json` (`last_generated_output`) when available.
 - `--review-pdf` must be a filename only (no path) when provided.
 - `--prompt-md` is optional. If omitted, the script looks for files matching `*prompt*.md` in the working directory:
@@ -84,7 +88,7 @@ Example `-ai-log.md`:
 
 - Review PDF file: `test-a_001-003.pdf`
 - Model: `gemini/gemini-2.5-flash`
-- Configuration: `temperature=0.0, detail=high`
+- Configuration: `temperature=0.0, detail=high, reasoning_effort=high`
 - Confidence score: `0.93`
 - Confidence label: `high`
 - Notes: Clear text with minor uncertainty around one table heading.
@@ -100,4 +104,15 @@ Live integration test:
 
 ```bash
 pytest -q -k transcribe_review_pdf
+```
+
+Example `transcribe.config.json`:
+
+```json
+{
+  "model": "gemini/gemini-2.5-flash",
+  "temperature": 0.0,
+  "reasoning_effort": "high",
+  "detail": "high"
+}
 ```
