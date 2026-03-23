@@ -344,6 +344,7 @@ def main() -> int:
             model=args.model,
             messages=build_messages(prompt_text, pdf_data_url),
             temperature=args.temperature,
+            reasoning_effort='high',
             response_format=build_response_format(schema),
         )
     except Exception as exc:
@@ -363,7 +364,9 @@ def main() -> int:
         'notes': raw.get('notes'),
         'transcription': normalize_transcription_newlines(raw.get('transcription', '')),
         'model': args.model,
-        'configuration': f'temperature={args.temperature}, detail=high',
+        'configuration': (
+            f'temperature={args.temperature}, detail=high, reasoning_effort=high'
+        ),
     }
 
     try:
