@@ -163,11 +163,13 @@ def test_live_integration_transcribes_review_pdf():
     assert out_md.read_text(encoding='utf-8').strip() != ''
     ai_log_text = out_ai_log_md.read_text(encoding='utf-8')
     assert 'Review PDF file: `test-a_001-003.pdf`' in ai_log_text
-    assert '- Model: `' in ai_log_text
-    assert (
-        '- Configuration: '
-        '`temperature=0.0, media_resolution=high, reasoning_effort=high`'
-    ) in ai_log_text
+    assert '- Model: `' not in ai_log_text
+    assert '- Configuration: `' not in ai_log_text
+    assert '## Transcribe config used' in ai_log_text
+    assert '"model": "gemini/gemini-2.5-flash"' in ai_log_text
+    assert '"temperature": 0.0' in ai_log_text
+    assert '"reasoning_effort": "high"' in ai_log_text
+    assert '"media_resolution": "high"' in ai_log_text
     assert '- Confidence score: `' in ai_log_text
     assert '- Confidence label: `' in ai_log_text
     assert '## Prompt used' in ai_log_text

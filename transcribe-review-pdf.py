@@ -320,8 +320,7 @@ def normalize_transcription_newlines(transcription: object) -> str:
 
 def build_ai_log_markdown(
     review_pdf_filename: str,
-    model: str,
-    configuration: str,
+    transcribe_config_text: str,
     confidence_score: object,
     confidence_label: object,
     notes: object,
@@ -334,11 +333,13 @@ def build_ai_log_markdown(
     return (
         '# AI transcription run log\n\n'
         f'- Review PDF file: `{review_pdf_filename}`\n'
-        f'- Model: `{model}`\n'
-        f'- Configuration: `{configuration}`\n'
         f'- Confidence score: `{confidence_score_text}`\n'
         f'- Confidence label: `{confidence_label_text}`\n'
-        f'- Notes: {notes_text}\n\n'
+        f'- Notes: {notes_text}\n'
+        '## Transcribe config used\n\n'
+        '```json\n'
+        f'{transcribe_config_text}\n'
+        '```\n\n'
         '## Prompt used\n\n'
         '````markdown\n'
         f'{prompt_text}\n'
@@ -386,6 +387,7 @@ def main() -> int:
         return 2
 
     prompt_text = prompt_md.read_text(encoding='utf-8')
+    transcribe_config_text = config_path.read_text(encoding='utf-8').strip()
     encoded_pdf = base64.b64encode(review_pdf_path.read_bytes()).decode('utf-8')
     pdf_data_url = f'data:application/pdf;base64,{encoded_pdf}'
     print(
@@ -444,8 +446,7 @@ def main() -> int:
     output_ai_log_md.write_text(
         build_ai_log_markdown(
             review_pdf_filename=review_pdf_path.name,
-            model=transcribe_config['model'],
-            configuration=payload['configuration'],
+            transcribe_config_text=transcribe_config_text,
             confidence_score=payload['confidence_score'],
             confidence_label=payload['confidence_label'],
             notes=payload['notes'],

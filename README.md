@@ -79,7 +79,7 @@ Notes:
   - if exactly one file matches, it is used automatically
   - if multiple files match, you can choose interactively with up/down arrows
   - if none match, the script exits with an error
-- `<review_pdf_stem>-ai-log.md` includes: review PDF filename, model, configuration, confidence score, confidence label, notes, and full prompt used.
+- `<review_pdf_stem>-ai-log.md` includes: review PDF filename, confidence score, confidence label, notes, full transcribe config JSON used, and full prompt used.
 
 Example `-ai-log.md`:
 
@@ -87,11 +87,20 @@ Example `-ai-log.md`:
 # AI transcription run log
 
 - Review PDF file: `test-a_001-003.pdf`
-- Model: `gemini/gemini-2.5-flash`
-- Configuration: `temperature=0.0, media_resolution=high, reasoning_effort=high`
 - Confidence score: `0.93`
 - Confidence label: `high`
 - Notes: Clear text with minor uncertainty around one table heading.
+
+## Transcribe config used
+
+```json
+{
+  "model": "gemini/gemini-2.5-flash",
+  "temperature": 0.0,
+  "reasoning_effort": "high",
+  "media_resolution": "high"
+}
+```
 
 ## Prompt used
 
