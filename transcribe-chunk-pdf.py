@@ -148,8 +148,12 @@ def resolve_prompt_md(working_dir: Path) -> Path:
         path for path in working_dir.glob('*prompt*.md') if path.is_file()
     )
     if not prompt_candidates:
+        default_prompt = SCRIPT_DIR / 'prompt.md'
+        if default_prompt.exists():
+            return default_prompt
         raise ValueError(
-            f'No prompt markdown files found in {working_dir} matching *prompt*.md'
+            f'No prompt markdown files found in {working_dir} matching *prompt*.md '
+            f'and fallback prompt not found: {default_prompt}'
         )
 
     if len(prompt_candidates) == 1:
@@ -397,6 +401,7 @@ def main() -> int:
     transcribe_config_text = config_path.read_text(encoding='utf-8').strip()
     encoded_pdf = base64.b64encode(chunk_pdf_path.read_bytes()).decode('utf-8')
     pdf_data_url = f'data:application/pdf;base64,{encoded_pdf}'
+    print(f'Using prompt file: {prompt_md}')
     print(
         f'Transcribing {chunk_pdf_path.name} with {transcribe_config["model"]}; '
         'this can take a while...',

@@ -3,6 +3,7 @@ import subprocess
 import sys
 from importlib.util import module_from_spec, spec_from_file_location
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -133,6 +134,87 @@ def test_invalid_config_media_resolution_rejected(tmp_path: Path):
 
     with pytest.raises(ValueError, match='Invalid config file'):
         module.load_transcribe_config(config_path)
+
+
+def test_resolve_prompt_md_falls_back_to_script_prompt(tmp_path: Path):
+    module = load_transcribe_module()
+    working_dir = tmp_path / 'working'
+    script_dir = tmp_path / 'script'
+    working_dir.mkdir(parents=True, exist_ok=True)
+    script_dir.mkdir(parents=True, exist_ok=True)
+    fallback_prompt = script_dir / 'prompt.md'
+    fallback_prompt.write_text('fallback prompt', encoding='utf-8')
+    module.SCRIPT_DIR = script_dir
+
+    resolved = module.resolve_prompt_md(working_dir)
+
+    assert resolved == fallback_prompt
+
+
+def test_resolve_prompt_md_raises_when_no_working_or_fallback_prompt(tmp_path: Path):
+    module = load_transcribe_module()
+    working_dir = tmp_path / 'working'
+    script_dir = tmp_path / 'script'
+    working_dir.mkdir(parents=True, exist_ok=True)
+    script_dir.mkdir(parents=True, exist_ok=True)
+    module.SCRIPT_DIR = script_dir
+
+    with pytest.raises(ValueError, match='fallback prompt not found'):
+        module.resolve_prompt_md(working_dir)
+
+
+def test_main_prints_full_prompt_path_before_inference(tmp_path: Path, monkeypatch, capsys):
+    module = load_transcribe_module()
+    working_dir = tmp_path / 'working'
+    chunk_dir = working_dir / 'chunk-pdfs'
+    chunk_dir.mkdir(parents=True, exist_ok=True)
+    prompt_path = working_dir / 'prompt.md'
+    prompt_path.write_text('prompt body', encoding='utf-8')
+    chunk_pdf_path = chunk_dir / 'sample.pdf'
+    chunk_pdf_path.write_bytes(b'%PDF-1.4\n% fake pdf bytes')
+    config_path = working_dir / module.TRANSCRIBE_CONFIG_FILENAME
+    write_config(
+        config_path,
+        '{"model":"gemini/gemini-2.5-flash","temperature":0.0,'
+        '"reasoning_effort":"medium","media_resolution":"high",'
+        '"sys_instructions":"x"}',
+    )
+
+    monkeypatch.setenv('GEMINI_API_KEY', 'test-key')
+    monkeypatch.setattr(module, 'get_pdf_page_count', lambda _: 1)
+    monkeypatch.setattr(
+        module,
+        'completion',
+        lambda **kwargs: SimpleNamespace(
+            choices=[
+                SimpleNamespace(
+                    message=SimpleNamespace(
+                        content='{"confidence_score":1.0,"confidence_label":"high",'
+                        '"notes":"ok","transcription":"hello"}'
+                    )
+                )
+            ]
+        ),
+    )
+    monkeypatch.setattr(
+        sys,
+        'argv',
+        [
+            str(SCRIPT_PATH),
+            '--working-dir',
+            str(working_dir),
+            '--chunk-pdf',
+            'sample.pdf',
+            '--prompt-md',
+            str(prompt_path),
+        ],
+    )
+
+    exit_code = module.main()
+    stdout = capsys.readouterr().out
+
+    assert exit_code == 0
+    assert f'Using prompt file: {prompt_path.resolve()}' in stdout
 
 
 @pytest.mark.integration
