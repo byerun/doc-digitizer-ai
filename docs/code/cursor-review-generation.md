@@ -94,7 +94,7 @@ Create a new command-line Python script that:
 ## Verification steps
 
 - Prepare fixture content in `tests/test-1/`:
-  - replace `test.adoc` with `test-a.adoc` and `test-b.adoc`
+  - use `test-a.adoc` and `test-b.adoc` as the AsciiDoc sources
   - update titles to represent different parts of the same work
   - add explicit page breaks so each AsciiDoc renders to 5 PDF pages
   - generate PDFs via `asciidoctor-pdf` and place them in `tests/test-1/source-pdfs/`
