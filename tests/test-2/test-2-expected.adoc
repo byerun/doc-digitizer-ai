@@ -1,0 +1,17 @@
+// Page 1
+This content serves as a test of
+preserving line breaks in
+paragraphs found in the original
+text to be transcribed. Doing so
+can aid in verifying the
+transcription by person by having
+the original in one window on the
+computer monitor next to another
+window with the transcription so
+that each line in both windows
+can be directly compared.
+
+In addition, this content serves to
+test that hyphenation is removed
+as needed so that it no preservation
+of the hyphen is done.
