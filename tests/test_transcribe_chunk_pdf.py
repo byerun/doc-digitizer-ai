@@ -96,6 +96,23 @@ def test_invalid_review_pdf_path_input_rejected():
         assert 'filename, not a path' in result.stderr
 
 
+def test_extract_usage_tokens_reads_litellm_usage():
+    module = load_transcribe_module()
+    usage = SimpleNamespace(
+        prompt_tokens=100,
+        completion_tokens=50,
+        total_tokens=150,
+    )
+    response = SimpleNamespace(usage=usage)
+    assert module.extract_usage_tokens(response) == (100, 50, 150)
+
+
+def test_extract_usage_tokens_returns_none_when_missing():
+    module = load_transcribe_module()
+    response = SimpleNamespace(usage=None)
+    assert module.extract_usage_tokens(response) == (None, None, None)
+
+
 def test_config_path_resolution_prefers_working_dir(tmp_path: Path):
     module = load_transcribe_module()
     working_dir = tmp_path / 'working'
@@ -193,7 +210,12 @@ def test_main_prints_full_prompt_path_before_inference(tmp_path: Path, monkeypat
                         '"notes":"ok","transcription":"hello"}'
                     )
                 )
-            ]
+            ],
+            usage=SimpleNamespace(
+                prompt_tokens=10,
+                completion_tokens=20,
+                total_tokens=30,
+            ),
         ),
     )
     monkeypatch.setattr(
@@ -215,6 +237,12 @@ def test_main_prints_full_prompt_path_before_inference(tmp_path: Path, monkeypat
 
     assert exit_code == 0
     assert f'Using prompt file: {prompt_path.resolve()}' in stdout
+    ai_log = (working_dir / 'transcriptions' / 'sample-ai-log.md').read_text(
+        encoding='utf-8'
+    )
+    assert '- Prompt tokens (input): `10`' in ai_log
+    assert '- Completion tokens (output): `20`' in ai_log
+    assert '- Total tokens: `30`' in ai_log
 
 
 @pytest.mark.integration
@@ -258,4 +286,7 @@ def test_live_integration_transcribes_review_pdf():
     assert '"sys_instructions":' in ai_log_text
     assert '- Confidence score: `' in ai_log_text
     assert '- Confidence label: `' in ai_log_text
+    assert '- Prompt tokens (input): `' in ai_log_text
+    assert '- Completion tokens (output): `' in ai_log_text
+    assert '- Total tokens: `' in ai_log_text
     assert '## Prompt used' in ai_log_text

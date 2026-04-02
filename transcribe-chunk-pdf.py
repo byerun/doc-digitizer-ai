@@ -334,6 +334,27 @@ def get_pdf_page_count(pdf_path: Path) -> int:
         raise ValueError(f'Could not read PDF page count from {pdf_path}: {exc}') from exc
 
 
+def extract_usage_tokens(response) -> tuple[object, object, object]:
+    """Return (prompt_tokens, completion_tokens, total_tokens) from a LiteLLM response."""
+    usage = getattr(response, 'usage', None)
+    if usage is None:
+        return (None, None, None)
+    return (
+        getattr(usage, 'prompt_tokens', None),
+        getattr(usage, 'completion_tokens', None),
+        getattr(usage, 'total_tokens', None),
+    )
+
+
+def format_token_log_value(value: object) -> str:
+    if value is None:
+        return '(not reported)'
+    try:
+        return str(int(value))
+    except (TypeError, ValueError):
+        return str(value)
+
+
 def build_ai_log_markdown(
     chunk_pdf_filename: str,
     run_started_at: str,
@@ -345,6 +366,9 @@ def build_ai_log_markdown(
     confidence_label: object,
     notes: object,
     prompt_text: str,
+    prompt_tokens: object = None,
+    completion_tokens: object = None,
+    total_tokens: object = None,
 ) -> str:
     confidence_score_text = '' if confidence_score is None else str(confidence_score)
     confidence_label_text = '' if confidence_label is None else str(confidence_label)
@@ -367,6 +391,9 @@ def build_ai_log_markdown(
         f'- Total pages: `{total_pages}`\n'
         f'- Total inference time (minutes): `{inference_time_text}`\n'
         f'- Average time per page (seconds): `{average_time_per_page_text}`\n'
+        f'- Prompt tokens (input): `{format_token_log_value(prompt_tokens)}`\n'
+        f'- Completion tokens (output): `{format_token_log_value(completion_tokens)}`\n'
+        f'- Total tokens: `{format_token_log_value(total_tokens)}`\n'
         f'- Confidence score: `{confidence_score_text}`\n'
         f'- Confidence label: `{confidence_label_text}`\n'
         f'- Notes: {notes_text}\n'
@@ -431,6 +458,8 @@ def transcribe_single_chunk(
         print(f'LiteLLM request failed: {exc}', file=sys.stderr)
         return 1
 
+    prompt_tokens, completion_tokens, total_tokens = extract_usage_tokens(response)
+
     average_time_per_page_seconds = (
         inference_time_seconds / total_pages if total_pages > 0 else None
     )
@@ -485,6 +514,9 @@ def transcribe_single_chunk(
             confidence_label=payload['confidence_label'],
             notes=payload['notes'],
             prompt_text=prompt_text,
+            prompt_tokens=prompt_tokens,
+            completion_tokens=completion_tokens,
+            total_tokens=total_tokens,
         ),
         encoding='utf-8',
     )
