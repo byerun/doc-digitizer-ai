@@ -13,5 +13,5 @@ can be directly compared.
 
 In addition, this content serves to
 test that hyphenation is removed
-as needed so that it no preserv-
-ation of the hyphen is done.
+as needed so that it no preservation
+of the hyphen is done.
