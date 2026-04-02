@@ -26,3 +26,7 @@ def test_live_integration_test_2_matches_expected_adoc():
     assert TEST_2_OUTPUT_PATH.read_text(encoding='utf-8') == TEST_2_EXPECTED_PATH.read_text(
         encoding='utf-8'
     )
+
+
+if __name__ == '__main__':
+    raise SystemExit(pytest.main([__file__, '-v']))

@@ -50,3 +50,7 @@ def test_live_integration_test_1_transcribes_and_logs():
     assert TEST_1_OUTPUT_PATH.read_text(encoding='utf-8').strip() != ''
     ai_log_text = TEST_1_AI_LOG_PATH.read_text(encoding='utf-8')
     assert_common_ai_log_fields(ai_log_text, TEST_1_CHUNK_PDF_FILENAME)
+
+
+if __name__ == '__main__':
+    raise SystemExit(pytest.main([__file__, '-v']))
