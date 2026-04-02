@@ -2,7 +2,7 @@ from pathlib import Path
 
 import pytest
 
-from transcribe_integration_helpers import run_live_transcription, skip_if_missing_api_key
+from transcribe_integration_helpers import REPO_PROMPT_PATH, run_live_transcription, skip_if_missing_api_key
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -19,7 +19,11 @@ def test_live_integration_test_2_matches_expected_adoc():
     if TEST_2_OUTPUT_PATH.exists():
         TEST_2_OUTPUT_PATH.unlink()
 
-    result = run_live_transcription(WORKING_DIR_TEST_2, TEST_2_CHUNK_PDF_FILENAME)
+    result = run_live_transcription(
+        WORKING_DIR_TEST_2,
+        TEST_2_CHUNK_PDF_FILENAME,
+        REPO_PROMPT_PATH,
+    )
 
     assert result.returncode == 0, result.stderr
     assert TEST_2_OUTPUT_PATH.exists()
