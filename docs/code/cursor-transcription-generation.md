@@ -37,7 +37,7 @@ Expected behavior:
 - New CLI script: `[doc-digitizer-ai/transcribe-chunk-pdf.py](doc-digitizer-ai/transcribe-chunk-pdf.py)`
 - Schema (reuse/adapt): `[doc-digitizer-ai/transcription.schema.json](doc-digitizer-ai/transcription.schema.json)`
 - Tests (true integration): `[doc-digitizer-ai/tests/test_transcribe_chunk_pdf.py](doc-digitizer-ai/tests/test_transcribe_chunk_pdf.py)`
-- Prompt fixture: `[doc-digitizer-ai/tests/test-1/prompt.md](doc-digitizer-ai/tests/test-1/prompt.md)`
+- Prompt: `[doc-digitizer-ai/prompt.md](doc-digitizer-ai/prompt.md)`
 - Dependency updates: `[doc-digitizer-ai/requirements.txt](doc-digitizer-ai/requirements.txt)`
 - Usage docs: `[doc-digitizer-ai/README.md](doc-digitizer-ai/README.md)`
 

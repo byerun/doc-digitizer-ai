@@ -10,7 +10,6 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 SCRIPT_PATH = PROJECT_ROOT / 'transcribe-chunk-pdf.py'
 # Same file the transcribe script uses when the working dir has no *prompt*.md.
 REPO_PROMPT_PATH = PROJECT_ROOT / 'prompt.md'
-TEST_1_PROMPT_PATH = PROJECT_ROOT / 'tests' / 'test-1' / 'prompt.md'
 
 
 def skip_if_missing_api_key():

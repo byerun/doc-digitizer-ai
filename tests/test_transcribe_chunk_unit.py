@@ -11,7 +11,7 @@ import pytest
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 WORKING_DIR = PROJECT_ROOT / 'tests' / 'test-1'
 SCRIPT_PATH = PROJECT_ROOT / 'transcribe-chunk-pdf.py'
-PROMPT_PATH = WORKING_DIR / 'prompt.md'
+PROMPT_PATH = PROJECT_ROOT / 'prompt.md'
 
 
 def load_transcribe_module():

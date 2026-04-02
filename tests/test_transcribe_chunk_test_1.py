@@ -4,7 +4,7 @@ import pytest
 from pypdf import PdfReader, PdfWriter
 
 from transcribe_integration_helpers import (
-    TEST_1_PROMPT_PATH,
+    REPO_PROMPT_PATH,
     assert_common_ai_log_fields,
     run_live_transcription,
     skip_if_missing_api_key,
@@ -43,7 +43,7 @@ def test_live_integration_test_1_transcribes_and_logs():
     if TEST_1_AI_LOG_PATH.exists():
         TEST_1_AI_LOG_PATH.unlink()
 
-    result = run_live_transcription(WORKING_DIR, TEST_1_CHUNK_PDF_FILENAME, TEST_1_PROMPT_PATH)
+    result = run_live_transcription(WORKING_DIR, TEST_1_CHUNK_PDF_FILENAME, REPO_PROMPT_PATH)
 
     assert result.returncode == 0, result.stderr
     assert TEST_1_OUTPUT_PATH.exists()
