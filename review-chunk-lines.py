@@ -1,20 +1,15 @@
 #!/usr/bin/env python3
 """
-Line-by-line review UI: show PDF page crops next to editable transcription text.
+Line-by-line transcription review (PySide6): PDF line crops with editable text.
 
 Requires Poppler (system) for pdf2image — see README.md.
 
-``--working-dir`` is the same as for ``transcribe-chunk-pdf.py``: the directory
-that *contains* ``chunk-pdfs/`` and ``transcriptions/`` (not either of those
-folders themselves).
+``--working-dir`` matches ``transcribe-chunk-pdf.py``: the directory that contains
+``chunk-pdfs/`` and ``transcriptions/``.
 
-Streamlit may prompt for an email in the terminal before this file runs; that
-comes from the ``streamlit`` CLI, not this app. Use ``STREAMLIT_SERVER_HEADLESS=true``
-on the command line, repo ``.streamlit/config.toml`` (when cwd is this repo), or
-a one-time ``~/.streamlit/credentials.toml`` with ``email = ""`` — see README.
+  python review-chunk-lines.py --working-dir <dir> --chunk-pdf <file.pdf>
 
-Run:
-  streamlit run review-chunk-lines.py -- --working-dir . --chunk-pdf mychunk.pdf
+Optional: ``--raw-json`` (defaults to ``transcriptions/<stem>_raw.json`` under the working dir).
 """
 
 from __future__ import annotations
@@ -23,12 +18,25 @@ import argparse
 import json
 import re
 import sys
+from dataclasses import dataclass
 from pathlib import Path
 
-import streamlit as st
-import streamlit.components.v1 as components
 from pdf2image import convert_from_path
 from PIL import Image
+from PySide6.QtCore import Qt, QTimer
+from PySide6.QtGui import QFont, QFontMetrics, QImage, QPixmap
+from PySide6.QtWidgets import (
+    QApplication,
+    QHBoxLayout,
+    QLabel,
+    QLineEdit,
+    QMainWindow,
+    QMessageBox,
+    QPlainTextEdit,
+    QPushButton,
+    QVBoxLayout,
+    QWidget,
+)
 
 # Prompt-injected markers (not printed on the page); skip in the review UI.
 _PAGE_MARKER_PATTERN = re.compile(r'^\s*//\s*Page\s+\d+\s*$', re.IGNORECASE)
@@ -47,13 +55,9 @@ def reviewable_line_indices(lines: list) -> list[int]:
     return [i for i, ln in enumerate(lines) if not is_injected_page_marker(ln.get('text', ''))]
 
 
-def parse_cli_args() -> argparse.Namespace | None:
-    argv = sys.argv[1:]
-    if '--' in argv:
-        argv = argv[argv.index('--') + 1 :]
-    # When started via `streamlit run`, the CLI usually forwards only the
-    # script arguments (no `--` in sys.argv), so we parse argv[1:] as above.
-
+def parse_cli_args(argv: list[str] | None = None) -> argparse.Namespace | None:
+    if argv is None:
+        argv = sys.argv[1:]
     if not argv:
         return None
 
@@ -86,6 +90,63 @@ def parse_cli_args() -> argparse.Namespace | None:
     return parser.parse_args(argv)
 
 
+@dataclass(frozen=True)
+class ReviewPaths:
+    working_dir: Path
+    chunk_pdf_path: Path
+    raw_path: Path
+    final_path: Path
+    chunk_name: str
+    stem: str
+
+
+def resolve_review_paths(cli: argparse.Namespace) -> ReviewPaths | str:
+    working_dir = cli.working_dir.resolve()
+    chunk_pdfs_dir = working_dir / 'chunk-pdfs'
+    transcriptions_dir = working_dir / 'transcriptions'
+    if not chunk_pdfs_dir.is_dir():
+        return (
+            f'Expected a chunk-pdfs directory at {chunk_pdfs_dir}. '
+            '--working-dir should be the project/work folder that contains '
+            'chunk-pdfs/ (and usually transcriptions/), same as '
+            'transcribe-chunk-pdf.py.'
+        )
+
+    chunk_name = cli.chunk_pdf.strip()
+    if Path(chunk_name).name != chunk_name:
+        return 'Use chunk PDF filename only, not a path.'
+    if not chunk_name.lower().endswith('.pdf'):
+        return "Chunk PDF filename must end with '.pdf'."
+
+    chunk_pdf_path = chunk_pdfs_dir / chunk_name
+    if not chunk_pdf_path.is_file():
+        return f'Chunk PDF not found: {chunk_pdf_path}'
+
+    stem = Path(chunk_name).stem
+    if cli.raw_json is not None:
+        raw_candidate = cli.raw_json
+        raw_path = (
+            (working_dir / raw_candidate).resolve()
+            if not raw_candidate.is_absolute()
+            else raw_candidate.resolve()
+        )
+    else:
+        raw_path = transcriptions_dir / f'{stem}_raw.json'
+    final_path = transcriptions_dir / f'{stem}_final.json'
+
+    if not raw_path.is_file():
+        return f'Raw JSON not found: {raw_path}'
+
+    return ReviewPaths(
+        working_dir=working_dir,
+        chunk_pdf_path=chunk_pdf_path,
+        raw_path=raw_path,
+        final_path=final_path,
+        chunk_name=chunk_name,
+        stem=stem,
+    )
+
+
 def clamp_box_2d_to_pixels(
     box_2d: list,
     width: int,
@@ -106,8 +167,6 @@ def clamp_box_2d_to_pixels(
         lower = min(height, upper + 1)
     box_h = lower - upper
     box_w = right - left
-    # Scale padding to the model box, not the full page — page-based pad_bot could be ~80px on
-    # tall rasters and pulled the next line into the crop. Keep top tight; modest bottom for descenders.
     pad_top = min(8, max(0, box_h // 14))
     pad_bot = min(28, max(3, box_h // 5 + 2))
     pad_x = min(24, max(1, box_w // 50 + 1))
@@ -123,7 +182,6 @@ def clamp_box_2d_to_pixels(
 
 
 def estimate_transcription_font_px(text: str, crop_width: int | None) -> int:
-    """Rough px font size before the JS fit runs (initial render only)."""
     t = text.rstrip() if isinstance(text, str) else text
     n = max(len(t), 1)
     w = min(1100, max(crop_width or 640, 320))
@@ -134,79 +192,6 @@ def rstrip_line_text(value: object) -> object:
     if isinstance(value, str):
         return value.rstrip()
     return value
-
-
-def inject_transcription_font_fit() -> None:
-    """Binary-search font size vs image width; small trailing gap is acceptable."""
-    components.html(
-        """
-        <script>
-        (function () {
-          var doc = window.parent.document;
-          function innerTextWidth(el) {
-            var cs = window.parent.getComputedStyle(el);
-            var pl = parseFloat(cs.paddingLeft) || 0;
-            var pr = parseFloat(cs.paddingRight) || 0;
-            return Math.max(0, el.clientWidth - pl - pr);
-          }
-          function fit() {
-            var imgs = doc.querySelectorAll('[data-testid="stImage"] img');
-            var tas = doc.querySelectorAll('[data-testid="stTextArea"] textarea');
-            var inps = doc.querySelectorAll('[data-testid="stTextInput"] input');
-            var ta = tas.length ? tas[tas.length - 1] : null;
-            var inp = inps.length ? inps[inps.length - 1] : null;
-            var el = ta || inp;
-            if (!imgs.length || !el) { return; }
-            var img = imgs[imgs.length - 1];
-            el.style.width = '100%';
-            el.style.boxSizing = 'border-box';
-            if (ta) { ta.style.whiteSpace = 'nowrap'; }
-            void el.offsetWidth;
-            var iw = img.clientWidth;
-            var inner = innerTextWidth(el);
-            if (inner < 40) { return; }
-            var maxW = Math.min(iw, inner) - 1;
-            if (maxW < 36) { return; }
-            var lo = 8;
-            var hi = 320;
-            var i;
-            for (i = 0; i < 32; i++) {
-              var mid = (lo + hi) / 2;
-              el.style.fontSize = mid + 'px';
-              el.style.lineHeight = '1.2';
-              void el.offsetWidth;
-              if (el.scrollWidth <= maxW) { lo = mid; } else { hi = mid; }
-            }
-            el.style.fontSize = lo + 'px';
-            void el.offsetWidth;
-            var fs = lo;
-            var j;
-            for (j = 0; j < 36; j++) {
-              var next = fs + 0.5;
-              if (next > 340) { break; }
-              el.style.fontSize = next + 'px';
-              void el.offsetWidth;
-              if (el.scrollWidth > maxW) {
-                el.style.fontSize = fs + 'px';
-                break;
-              }
-              fs = next;
-            }
-            if (!el.dataset.reviewFitBound) {
-              el.dataset.reviewFitBound = '1';
-              el.addEventListener('input', function () { setTimeout(fit, 0); });
-            }
-          }
-          setTimeout(fit, 0);
-          setTimeout(function () { window.parent.requestAnimationFrame(fit); }, 0);
-          setTimeout(fit, 120);
-          setTimeout(fit, 350);
-          window.parent.addEventListener('resize', fit);
-        })();
-        </script>
-        """,
-        height=0,
-    )
 
 
 def load_page_images(pdf_path: Path) -> list[Image.Image]:
@@ -224,237 +209,324 @@ def save_payload(path: Path, payload: dict) -> None:
     path.write_text(json.dumps(payload, indent=2, ensure_ascii=False) + '\n', encoding='utf-8')
 
 
-def main() -> None:
-    st.set_page_config(page_title='Line review', layout='wide')
+def pil_to_qpixmap(im: Image.Image) -> QPixmap:
+    if im.mode != 'RGB':
+        im = im.convert('RGB')
+    w, h = im.size
+    bpl = 3 * w
+    buf = im.tobytes('raw', 'RGB')
+    qimg = QImage(buf, w, h, bpl, QImage.Format.Format_RGB888)
+    return QPixmap.fromImage(qimg)
+
+
+def fit_line_edit_font(line_edit: QLineEdit, max_text_width: int) -> None:
+    text = line_edit.text()
+    font = QFont(line_edit.font())
+    font.setStyleHint(QFont.SansSerif)
+    if not text:
+        font.setPixelSize(12)
+        line_edit.setFont(font)
+        return
+    lo, hi = 8, 400
+    best = 8
+    while lo <= hi:
+        mid = (lo + hi) // 2
+        font.setPixelSize(mid)
+        fm = QFontMetrics(font)
+        if fm.horizontalAdvance(text) <= max_text_width:
+            best = mid
+            lo = mid + 1
+        else:
+            hi = mid - 1
+    font.setPixelSize(best)
+    line_edit.setFont(font)
+
+
+class ReviewMainWindow(QMainWindow):
+    def __init__(
+        self,
+        paths: ReviewPaths,
+        page_images: list | None = None,
+        parent: QWidget | None = None,
+    ) -> None:
+        super().__init__(parent)
+        self._paths = paths
+        self.setWindowTitle(f'Line review — {paths.chunk_name}')
+        self.resize(880, 620)
+        self._page_images = page_images if page_images is not None else load_page_images(
+            paths.chunk_pdf_path,
+        )
+        self._payload = load_payload(paths.raw_path, paths.final_path)
+        self._source_raw_path = str(paths.raw_path)
+        self._final_path = paths.final_path
+        lines = self._payload.get('lines')
+        if not isinstance(lines, list) or not lines:
+            raise ValueError('Invalid payload: missing or empty "lines"')
+        self._lines: list = lines
+        self._review_indices = reviewable_line_indices(lines)
+        if not self._review_indices:
+            raise ValueError(
+                'No lines to review: every entry looks like a synthetic '
+                '`// Page N` marker.'
+            )
+        self._ridx = 0
+        self._crop_pixmap: QPixmap | None = None
+        self._raw_crop: Image.Image | None = None
+
+        central = QWidget()
+        self.setCentralWidget(central)
+        root = QVBoxLayout(central)
+
+        n_skip = len(lines) - len(self._review_indices)
+        self._header = QLabel(
+            f'Chunk: {paths.chunk_name} · Raw: {paths.raw_path.name} · '
+            f'Final: {paths.final_path.name}'
+        )
+        self._header.setWordWrap(True)
+        root.addWidget(self._header)
+        if n_skip:
+            skip_lbl = QLabel(
+                f'Skipping {n_skip} synthetic page marker line(s) (`// Page …`). '
+                'They remain in the saved JSON.'
+            )
+            skip_lbl.setWordWrap(True)
+            root.addWidget(skip_lbl)
+
+        self._page_lbl = QLabel()
+        self._line_lbl = QLabel()
+        f = self._line_lbl.font()
+        f.setPointSizeF(f.pointSizeF() + 2)
+        f.setBold(True)
+        self._line_lbl.setFont(f)
+        root.addWidget(self._page_lbl)
+        root.addWidget(self._line_lbl)
+
+        self._err_lbl = QLabel()
+        self._err_lbl.setStyleSheet('color: #b06000;')
+        self._err_lbl.setWordWrap(True)
+        root.addWidget(self._err_lbl)
+
+        self._crop_label = QLabel()
+        self._crop_label.setAlignment(Qt.AlignLeft | Qt.AlignTop)
+        root.addWidget(self._crop_label)
+
+        self._line_edit = QLineEdit()
+        self._line_edit.setStyleSheet(
+            'QLineEdit { padding: 6px 8px; border: 1px solid #bbb; border-radius: 4px; }'
+        )
+        root.addWidget(self._line_edit)
+
+        self._plain = QPlainTextEdit()
+        self._plain.setFixedHeight(88)
+        self._plain.setStyleSheet(
+            'QPlainTextEdit { padding: 6px 8px; border: 1px solid #bbb; border-radius: 4px; }'
+        )
+        self._plain.hide()
+        root.addWidget(self._plain)
+
+        btn_row = QHBoxLayout()
+        self._btn_prev = QPushButton('◀ Prev')
+        self._btn_next = QPushButton('Next ▶')
+        self._btn_save = QPushButton('Save to final JSON')
+        self._btn_reload = QPushButton('Reload from raw')
+        btn_row.addWidget(self._btn_prev)
+        btn_row.addWidget(self._btn_next)
+        btn_row.addWidget(self._btn_save)
+        btn_row.addWidget(self._btn_reload)
+        btn_row.addStretch()
+        root.addLayout(btn_row)
+
+        self._btn_prev.clicked.connect(self._on_prev)
+        self._btn_next.clicked.connect(self._on_next)
+        self._btn_save.clicked.connect(self._on_save)
+        self._btn_reload.clicked.connect(self._on_reload)
+        self._line_edit.textChanged.connect(self._schedule_fit_font)
+        self._plain.textChanged.connect(self._schedule_fit_font)
+
+        self._show_line()
+
+    def resizeEvent(self, event) -> None:
+        super().resizeEvent(event)
+        QTimer.singleShot(0, self._apply_crop_scale_and_font)
+
+    def _schedule_fit_font(self) -> None:
+        QTimer.singleShot(0, self._fit_editor_font_only)
+
+    def _max_crop_display_width(self) -> int:
+        w = self.centralWidget().width() if self.centralWidget() else 800
+        return max(320, min(1000, w - 32))
+
+    def _commit_current(self) -> None:
+        idx = self._review_indices[self._ridx]
+        if self._plain.isVisible():
+            self._lines[idx]['text'] = rstrip_line_text(self._plain.toPlainText())
+        else:
+            self._lines[idx]['text'] = rstrip_line_text(self._line_edit.text())
+
+    def _show_line(self) -> None:
+        n_review = len(self._review_indices)
+        self._ridx = max(0, min(self._ridx, n_review - 1))
+        idx = self._review_indices[self._ridx]
+        line = self._lines[idx]
+        page_number = line.get('page_number')
+        box_2d = line.get('box_2d')
+        text = line.get('text', '')
+        if not isinstance(text, str):
+            text = ''
+        text = text.rstrip()
+
+        self._err_lbl.clear()
+        self._raw_crop = None
+        self._crop_pixmap = None
+        self._crop_label.clear()
+
+        n_pages = len(self._page_images)
+        err: str | None = None
+        if not isinstance(page_number, int) or page_number < 1:
+            err = f'Invalid page_number: {page_number!r}'
+        elif page_number > n_pages:
+            err = (
+                f'page_number {page_number} is out of range '
+                f'(chunk has {n_pages} page(s)).'
+            )
+        elif not isinstance(box_2d, list) or len(box_2d) != 4:
+            err = f'Invalid box_2d: {box_2d!r}'
+        else:
+            page_img = self._page_images[page_number - 1]
+            w, h = page_img.size
+            left, upper, right, lower = clamp_box_2d_to_pixels(box_2d, w, h)
+            self._raw_crop = page_img.crop((left, upper, right, lower))
+            self._crop_pixmap = pil_to_qpixmap(self._raw_crop)
+
+        if err:
+            self._err_lbl.setText(err)
+
+        pn = str(page_number) if isinstance(page_number, int) and page_number >= 1 else '—'
+        self._page_lbl.setText(f'Page {pn}')
+        self._line_lbl.setText(f'Line {self._ridx + 1} / {n_review}')
+
+        multiline = '\n' in text
+        if multiline:
+            self._plain.setPlainText(text)
+            self._plain.show()
+            self._line_edit.hide()
+            px = estimate_transcription_font_px(
+                text,
+                self._raw_crop.width if self._raw_crop else None,
+            )
+            pf = QFont()
+            pf.setPixelSize(px)
+            pf.setStyleHint(QFont.SansSerif)
+            self._plain.setFont(pf)
+        else:
+            self._line_edit.setText(text)
+            self._line_edit.show()
+            self._plain.hide()
+
+        self._btn_prev.setEnabled(self._ridx > 0)
+        self._btn_next.setEnabled(self._ridx < n_review - 1)
+
+        QTimer.singleShot(0, self._apply_crop_scale_and_font)
+
+    def _apply_crop_scale_and_font(self) -> None:
+        if self._raw_crop is None or self._crop_pixmap is None or self._crop_pixmap.isNull():
+            return
+        max_w = self._max_crop_display_width()
+        ow = self._crop_pixmap.width()
+        if ow > max_w:
+            scaled = self._crop_pixmap.scaledToWidth(
+                max_w,
+                Qt.SmoothTransformation,
+            )
+        else:
+            scaled = self._crop_pixmap
+        self._crop_label.setPixmap(scaled)
+        self._crop_label.setFixedWidth(scaled.width())
+
+        self._line_edit.setFixedWidth(scaled.width())
+        self._plain.setFixedWidth(scaled.width())
+        if self._line_edit.isVisible():
+            self._fit_editor_font_only()
+
+    def _fit_editor_font_only(self) -> None:
+        if not self._line_edit.isVisible():
+            return
+        inner = max(80, self._line_edit.width() - 16)
+        fit_line_edit_font(self._line_edit, inner)
+
+    def _on_prev(self) -> None:
+        if self._ridx <= 0:
+            return
+        self._commit_current()
+        self._ridx -= 1
+        self._show_line()
+
+    def _on_next(self) -> None:
+        if self._ridx >= len(self._review_indices) - 1:
+            return
+        self._commit_current()
+        self._ridx += 1
+        self._show_line()
+
+    def _on_save(self) -> None:
+        self._commit_current()
+        save_payload(self._final_path, self._payload)
+        self.statusBar().showMessage(f'Wrote {self._final_path}', 6000)
+
+    def _on_reload(self) -> None:
+        self._commit_current()
+        reply = QMessageBox.question(
+            self,
+            'Reload from raw',
+            'Discard edits in memory and reload from raw JSON on disk?',
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+        if reply != QMessageBox.Yes:
+            return
+        self._payload = json.loads(
+            Path(self._source_raw_path).read_text(encoding='utf-8'),
+        )
+        self._lines = self._payload['lines']
+        self._review_indices = reviewable_line_indices(self._lines)
+        if not self._review_indices:
+            QMessageBox.warning(self, 'Reload', 'No reviewable lines after reload.')
+            return
+        self._ridx = 0
+        self._show_line()
+
+
+def main() -> int:
     cli = parse_cli_args()
     if cli is None:
-        st.error(
-            'Missing arguments. Example:\n\n'
-            'streamlit run review-chunk-lines.py -- '
-            '--working-dir <dir> --chunk-pdf <filename.pdf>\n\n'
-            'Use the same <dir> as transcribe-chunk-pdf.py (the folder that '
-            'contains chunk-pdfs/ and transcriptions/).',
+        print(
+            'Usage: python review-chunk-lines.py '
+            '--working-dir <dir> --chunk-pdf <filename.pdf>\n'
+            'Optional: --raw-json <path>',
+            file=sys.stderr,
         )
-        st.stop()
+        return 2
 
-    working_dir = cli.working_dir.resolve()
-    chunk_pdfs_dir = working_dir / 'chunk-pdfs'
-    transcriptions_dir = working_dir / 'transcriptions'
-    if not chunk_pdfs_dir.is_dir():
-        st.error(
-            f'Expected a chunk-pdfs directory at {chunk_pdfs_dir}. '
-            '--working-dir should be the project/work folder that contains '
-            'chunk-pdfs/ (and usually transcriptions/), same as '
-            'transcribe-chunk-pdf.py.',
-        )
-        st.stop()
+    resolved = resolve_review_paths(cli)
+    if isinstance(resolved, str):
+        print(resolved, file=sys.stderr)
+        return 1
 
-    chunk_name = cli.chunk_pdf.strip()
-    if Path(chunk_name).name != chunk_name:
-        st.error('Use chunk PDF filename only, not a path.')
-        st.stop()
-    if not chunk_name.lower().endswith('.pdf'):
-        st.error("Chunk PDF filename must end with '.pdf'.")
-        st.stop()
+    try:
+        page_images = load_page_images(resolved.chunk_pdf_path)
+    except Exception as exc:
+        print(f'Could not rasterize PDF (is Poppler installed?). {exc}', file=sys.stderr)
+        return 1
 
-    chunk_pdf_path = chunk_pdfs_dir / chunk_name
-    if not chunk_pdf_path.is_file():
-        st.error(f'Chunk PDF not found: {chunk_pdf_path}')
-        st.stop()
-
-    stem = Path(chunk_name).stem
-    if cli.raw_json is not None:
-        raw_candidate = cli.raw_json
-        raw_path = (
-            (working_dir / raw_candidate).resolve()
-            if not raw_candidate.is_absolute()
-            else raw_candidate.resolve()
-        )
-    else:
-        raw_path = transcriptions_dir / f'{stem}_raw.json'
-    final_path = transcriptions_dir / f'{stem}_final.json'
-
-    if not raw_path.is_file():
-        st.error(f'Raw JSON not found: {raw_path}')
-        st.stop()
-
-    if 'page_images' not in st.session_state:
-        try:
-            st.session_state.page_images = load_page_images(chunk_pdf_path)
-        except Exception as exc:
-            st.error(
-                f'Could not rasterize PDF (is Poppler installed?). {exc}',
-            )
-            st.stop()
-
-    if 'payload' not in st.session_state:
-        st.session_state.payload = load_payload(raw_path, final_path)
-        st.session_state.source_raw_path = str(raw_path)
-        st.session_state.final_path = str(final_path)
-
-    if 'line_idx' not in st.session_state:
-        st.session_state.line_idx = 0
-
-    payload = st.session_state.payload
-    lines = payload.get('lines')
-    if not isinstance(lines, list) or not lines:
-        st.error('Invalid payload: missing or empty "lines" array.')
-        st.stop()
-
-    page_images: list[Image.Image] = st.session_state.page_images
-    n_pages = len(page_images)
-    n_lines = len(lines)
-
-    review_indices = reviewable_line_indices(lines)
-    n_review = len(review_indices)
-    if n_review == 0:
-        st.error(
-            'No lines to review: every entry looks like a synthetic '
-            '`// Page N` marker. Check the raw JSON or prompt.',
-        )
-        st.stop()
-
-    skipped = n_lines - n_review
-    st.title('Line-by-line transcription review')
-    st.caption(
-        f'Chunk: `{chunk_name}` · Raw: `{raw_path.name}` · '
-        f'Final: `{final_path.name}`',
-    )
-    if skipped:
-        st.caption(
-            f'Skipping **{skipped}** synthetic page marker line(s) (`// Page …`) '
-            'that are not on the scanned page. They stay in the saved JSON.',
-        )
-
-    ridx = int(st.session_state.line_idx)
-    ridx = max(0, min(ridx, n_review - 1))
-    st.session_state.line_idx = ridx
-
-    idx = review_indices[ridx]
-    line = lines[idx]
-    page_number = line.get('page_number')
-    box_2d = line.get('box_2d')
-    editor_key = f'editor_{idx}'
-    if st.session_state.get('last_editor_idx') != idx:
-        _t = line.get('text', '')
-        st.session_state[editor_key] = _t.rstrip() if isinstance(_t, str) else _t
-        st.session_state['last_editor_idx'] = idx
-
-    err_msg: str | None = None
-    crop_img: Image.Image | None = None
-    if not isinstance(page_number, int) or page_number < 1:
-        err_msg = f'Invalid page_number: {page_number!r}'
-    elif page_number > n_pages:
-        err_msg = (
-            f'page_number {page_number} is out of range (chunk has {n_pages} page(s)).'
-        )
-    elif not isinstance(box_2d, list) or len(box_2d) != 4:
-        err_msg = f'Invalid box_2d: {box_2d!r}'
-    else:
-        page_img = page_images[page_number - 1]
-        w, h = page_img.size
-        left, upper, right, lower = clamp_box_2d_to_pixels(box_2d, w, h)
-        crop_img = page_img.crop((left, upper, right, lower))
-
-    _raw_fit = st.session_state.get(editor_key, line.get('text', ''))
-    _txt_for_fit = _raw_fit.rstrip() if isinstance(_raw_fit, str) else _raw_fit
-    _multiline = isinstance(_raw_fit, str) and '\n' in _raw_fit
-    _fallback_fs = estimate_transcription_font_px(
-        _txt_for_fit if isinstance(_txt_for_fit, str) else '',
-        crop_img.width if crop_img else None,
-    )
-    pn_disp = (
-        str(page_number)
-        if isinstance(page_number, int) and page_number >= 1
-        else '—'
-    )
-    st.markdown(
-        '<style>'
-        'p.review-page-line { margin: 0 0 0.12rem 0 !important; font-size: 0.92rem !important; color: #5f6368 !important; }'
-        'p.review-line-line { margin: 0 0 0.35rem 0 !important; font-size: 1.35rem !important; font-weight: 600 !important; }'
-        '/* Streamlit vertical blocks use flex gap between element wrappers; negative margins pull crop + editor together */'
-        'div[data-testid="stElementContainer"]:has([data-testid="stImage"]) { margin-bottom: -2.25rem !important; overflow: visible !important; }'
-        'div[data-testid="stElementContainer"]:has([data-testid="stTextInput"]),'
-        'div[data-testid="stElementContainer"]:has([data-testid="stTextArea"]) { margin-top: -0.75rem !important; }'
-        'div[data-testid="stImage"] { margin-top: 0 !important; margin-bottom: 0 !important; overflow: visible !important; }'
-        'div[data-testid="stImage"] > div { margin-bottom: 0 !important; overflow: visible !important; }'
-        'div[data-testid="stImage"] img { object-fit: contain !important; max-height: none !important; }'
-        'div[data-testid="stTextArea"] { margin-top: 0 !important; margin-bottom: 0.35rem !important; '
-        'min-width: 0 !important; max-width: 100% !important; }'
-        'div[data-testid="stTextArea"] label { display: none !important; height: 0 !important; margin: 0 !important; padding: 0 !important; }'
-        'div[data-testid="stTextArea"] textarea { '
-        f'font-size: {_fallback_fs}px !important; line-height: 1.2 !important; '
-        'font-family: ui-sans-serif, system-ui, sans-serif !important; '
-        'padding: 2px 4px !important; box-sizing: border-box !important; '
-        'margin: 0 !important; white-space: nowrap !important; '
-        'overflow-x: auto !important; overflow-y: hidden !important; '
-        'resize: none !important; '
-        '}'
-        'div[data-testid="stTextInput"] { margin-top: 0 !important; margin-bottom: 0.35rem !important; '
-        'min-width: 0 !important; max-width: 100% !important; }'
-        'div[data-testid="stTextInput"] > div { margin-bottom: 0 !important; }'
-        'div[data-testid="stTextInput"] label { display: none !important; height: 0 !important; margin: 0 !important; padding: 0 !important; }'
-        'div[data-testid="stTextInput"] input { '
-        f'font-size: {_fallback_fs}px !important; line-height: 1.2 !important; '
-        'font-family: ui-sans-serif, system-ui, sans-serif !important; '
-        'padding: 2px 4px !important; box-sizing: border-box !important; '
-        'margin: 0 !important; width: 100% !important; '
-        '}'
-        '</style>'
-        f'<p class="review-page-line">Page {pn_disp}</p>'
-        f'<p class="review-line-line">Line {ridx + 1} / {n_review}</p>',
-        unsafe_allow_html=True,
-    )
-    if err_msg:
-        st.warning(err_msg)
-    elif crop_img is not None:
-        st.image(crop_img, use_container_width=True)
-
-    if _multiline:
-        st.text_area(
-            ' ',
-            height=52,
-            key=editor_key,
-            label_visibility='collapsed',
-        )
-    else:
-        st.text_input(
-            ' ',
-            key=editor_key,
-            label_visibility='collapsed',
-        )
-    inject_transcription_font_fit()
-
-    c1, c2, c3, c4 = st.columns(4)
-    if c1.button('◀ Prev', disabled=ridx <= 0):
-        st.session_state.payload['lines'][idx]['text'] = rstrip_line_text(
-            st.session_state.get(editor_key, line.get('text', '')),
-        )
-        st.session_state.line_idx = ridx - 1
-        st.rerun()
-    if c2.button('Next ▶', disabled=ridx >= n_review - 1):
-        st.session_state.payload['lines'][idx]['text'] = rstrip_line_text(
-            st.session_state.get(editor_key, line.get('text', '')),
-        )
-        st.session_state.line_idx = ridx + 1
-        st.rerun()
-    if c3.button('Save to final JSON'):
-        st.session_state.payload['lines'][idx]['text'] = rstrip_line_text(
-            st.session_state.get(editor_key, line.get('text', '')),
-        )
-        save_payload(Path(st.session_state.final_path), st.session_state.payload)
-        st.success(f'Wrote {st.session_state.final_path}')
-    if c4.button('Reload from raw (discard unsaved final file on disk)'):
-        st.session_state.payload = json.loads(
-            Path(st.session_state.source_raw_path).read_text(encoding='utf-8'),
-        )
-        st.session_state.line_idx = 0
-        for k in list(st.session_state.keys()):
-            if k.startswith('editor_'):
-                del st.session_state[k]
-        st.session_state.pop('last_editor_idx', None)
-        st.rerun()
+    app = QApplication(sys.argv)
+    try:
+        win = ReviewMainWindow(resolved, page_images=page_images)
+    except ValueError as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
+    win.show()
+    return app.exec()
 
 
 if __name__ == '__main__':
-    main()
+    sys.exit(main())
