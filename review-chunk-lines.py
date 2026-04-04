@@ -22,6 +22,7 @@ from __future__ import annotations
 import argparse
 import json
 import re
+import signal
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -631,6 +632,7 @@ def main() -> int:
         return 1
 
     app = QApplication(sys.argv)
+    app.setApplicationName('Line review')
     try:
         # Pass rasters in so we do not call pdf2image twice (here + window ctor).
         win = ReviewMainWindow(resolved, page_images=page_images)
@@ -638,7 +640,30 @@ def main() -> int:
         print(str(exc), file=sys.stderr)
         return 1
     win.show()
+    _install_terminal_interrupt_handlers(app)
     return app.exec()
+
+
+def _install_terminal_interrupt_handlers(app: QApplication) -> None:
+    """Let Ctrl-C in the shell quit the app.
+
+    ``app.exec()`` runs Qt's native event loop; without this, Python often never handles
+    SIGINT, so ``^C`` appears but the process stays running. A periodic no-op timer lets the
+    interpreter run signal handlers on Linux/macOS. ``kill -TERM <pid>`` also exits cleanly.
+    """
+    def _quit(_signum=None, _frame=None) -> None:
+        app.quit()
+
+    if hasattr(signal, 'SIGINT'):
+        signal.signal(signal.SIGINT, _quit)
+    if hasattr(signal, 'SIGTERM'):
+        signal.signal(signal.SIGTERM, _quit)
+
+    timer = QTimer()
+    timer.start(200)
+    timer.timeout.connect(lambda: None)
+    # Keep reference: if the timer is GC'd, the workaround stops working.
+    app._sigint_poll_timer = timer
 
 
 if __name__ == '__main__':

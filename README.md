@@ -130,6 +130,7 @@ python review-chunk-lines.py --working-dir tests/test-1 --chunk-pdf test-a_001-0
 
 - `--raw-json` is optional; defaults to `<working-dir>/transcriptions/<stem>_raw.json`. Relative paths are resolved under `--working-dir`.
 - If `_final.json` already exists for that stem, it is loaded so you can resume editing.
+- **Quit:** Close the window, or press Ctrl-C in the terminal (the app installs a handler so this works with Qt). If the process is stuck, from another terminal: `pkill -f review-chunk-lines.py` or `kill <pid>` (`kill -9` only as a last resort).
 
 ## Build PDFs from transcriptions (AsciiDoc)
 
