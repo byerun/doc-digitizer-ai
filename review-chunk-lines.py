@@ -29,10 +29,11 @@ from pathlib import Path
 
 from pdf2image import convert_from_path
 from PIL import Image
-from PySide6.QtCore import Qt, QTimer
+from PySide6.QtCore import Qt, QSize, QTimer
 from PySide6.QtGui import QFont, QFontMetrics, QIcon, QImage, QPixmap
 from PySide6.QtWidgets import (
     QApplication,
+    QGridLayout,
     QHBoxLayout,
     QLabel,
     QLineEdit,
@@ -40,9 +41,27 @@ from PySide6.QtWidgets import (
     QMessageBox,
     QPlainTextEdit,
     QPushButton,
+    QSizePolicy,
+    QStackedWidget,
     QVBoxLayout,
     QWidget,
 )
+
+
+class StackedSizeToCurrentWidget(QStackedWidget):
+    """``QStackedWidget`` uses the max of all pages' size hints; we only need the visible page."""
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.currentChanged.connect(self.updateGeometry)
+
+    def sizeHint(self) -> QSize:
+        w = self.currentWidget()
+        return w.sizeHint() if w is not None else super().sizeHint()
+
+    def minimumSizeHint(self) -> QSize:
+        w = self.currentWidget()
+        return w.minimumSizeHint() if w is not None else super().minimumSizeHint()
 
 # --- Architecture (quick map for future changes) ---
 # Data: ``payload['lines']`` is the full Pass 1/2 list. ``reviewable_line_indices`` skips
@@ -346,7 +365,7 @@ class ReviewMainWindow(QMainWindow):
         _ic = _review_app_icon()
         if not _ic.isNull():
             self.setWindowIcon(_ic)
-        self.resize(880, 620)
+        self.resize(880, 480)
         # Optional preloaded raster avoids double pdf2image work when main() already validated Poppler.
         self._page_images = page_images if page_images is not None else load_page_images(
             paths.chunk_pdf_path,
@@ -371,55 +390,125 @@ class ReviewMainWindow(QMainWindow):
         # UI: caption, optional skip notice, crop QLabel, single-line QLineEdit vs multiline plain.
         central = QWidget()
         self.setCentralWidget(central)
+        central.setSizePolicy(
+            QSizePolicy.Policy.Preferred,
+            QSizePolicy.Policy.Maximum,
+        )
         root = QVBoxLayout(central)
+        root.setContentsMargins(10, 8, 10, 8)
+        root.setSpacing(4)
 
         n_skip = len(lines) - len(self._review_indices)
-        self._header = QLabel(
-            f'Chunk: {paths.chunk_name} · Raw: {paths.raw_path.name} · '
-            f'Final: {paths.final_path.name}'
+        paths_wrap = QWidget()
+        paths_grid = QGridLayout(paths_wrap)
+        paths_grid.setContentsMargins(0, 0, 0, 0)
+        paths_grid.setHorizontalSpacing(12)
+        paths_grid.setVerticalSpacing(2)
+        paths_grid.setColumnStretch(0, 0)
+        paths_grid.setColumnStretch(1, 0)
+        align_lv = Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter
+        for r, (label, value) in enumerate(
+            (
+                ('Chunk', paths.chunk_name),
+                ('Raw', paths.raw_path.name),
+                ('Final', paths.final_path.name),
+            ),
+        ):
+            lab = QLabel(label)
+            val = QLabel(value)
+            lab.setAlignment(align_lv)
+            val.setAlignment(align_lv)
+            paths_grid.addWidget(lab, r, 0)
+            paths_grid.addWidget(val, r, 1)
+        paths_wrap.setSizePolicy(
+            QSizePolicy.Policy.Maximum,
+            QSizePolicy.Policy.Maximum,
         )
-        self._header.setWordWrap(True)
-        root.addWidget(self._header)
+        root.addWidget(paths_wrap, alignment=Qt.AlignmentFlag.AlignLeft)
+
         if n_skip:
             skip_lbl = QLabel(
                 f'Skipping {n_skip} synthetic page marker line(s) (`// Page …`). '
                 'They remain in the saved JSON.'
             )
-            skip_lbl.setWordWrap(True)
-            root.addWidget(skip_lbl)
+            skip_lbl.setWordWrap(False)
+            skip_lbl.setSizePolicy(
+                QSizePolicy.Policy.Preferred,
+                QSizePolicy.Policy.Maximum,
+            )
+            root.addWidget(skip_lbl, alignment=Qt.AlignmentFlag.AlignLeft)
 
         self._page_lbl = QLabel()
         self._line_lbl = QLabel()
-        f = self._line_lbl.font()
-        f.setPointSizeF(f.pointSizeF() + 2)
-        f.setBold(True)
-        self._line_lbl.setFont(f)
-        root.addWidget(self._page_lbl)
-        root.addWidget(self._line_lbl)
+        page_font = self._page_lbl.font()
+        page_font.setPointSizeF(page_font.pointSizeF() + 3)
+        page_font.setBold(True)
+        self._page_lbl.setFont(page_font)
+        line_font = self._line_lbl.font()
+        line_font.setPointSizeF(max(8.0, line_font.pointSizeF() - 0.5))
+        line_font.setBold(False)
+        self._line_lbl.setFont(line_font)
+        _lbl_pol = QSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Maximum)
+        self._page_lbl.setSizePolicy(_lbl_pol)
+        self._line_lbl.setSizePolicy(_lbl_pol)
+        root.addWidget(self._page_lbl, alignment=Qt.AlignmentFlag.AlignLeft)
+        root.addWidget(self._line_lbl, alignment=Qt.AlignmentFlag.AlignLeft)
 
         self._err_lbl = QLabel()
         self._err_lbl.setStyleSheet('color: #b06000;')
         self._err_lbl.setWordWrap(True)
-        root.addWidget(self._err_lbl)
+        self._err_lbl.setSizePolicy(
+            QSizePolicy.Policy.Preferred,
+            QSizePolicy.Policy.Maximum,
+        )
+        root.addWidget(self._err_lbl, alignment=Qt.AlignmentFlag.AlignLeft)
 
         self._crop_label = QLabel()
         self._crop_label.setAlignment(Qt.AlignLeft | Qt.AlignTop)
-        root.addWidget(self._crop_label)
+        self._crop_label.setContentsMargins(0, 0, 0, 0)
+        self._crop_label.setStyleSheet('QLabel { margin: 0px; padding: 0px; }')
+        self._crop_label.setSizePolicy(
+            QSizePolicy.Policy.Preferred,
+            QSizePolicy.Policy.Maximum,
+        )
 
         # Single-line path is default; ``_plain`` is for rare JSON lines with embedded newlines.
         self._line_edit = QLineEdit()
         self._line_edit.setStyleSheet(
-            'QLineEdit { padding: 6px 8px; border: 1px solid #bbb; border-radius: 4px; }'
+            'QLineEdit { padding: 6px 8px; border: 1px solid #bbb; border-radius: 4px; '
+            'margin-top: 0px; margin-bottom: 0px; }'
         )
-        root.addWidget(self._line_edit)
+        self._line_edit.setSizePolicy(
+            QSizePolicy.Policy.Preferred,
+            QSizePolicy.Policy.Fixed,
+        )
 
         self._plain = QPlainTextEdit()
         self._plain.setFixedHeight(88)
         self._plain.setStyleSheet(
-            'QPlainTextEdit { padding: 6px 8px; border: 1px solid #bbb; border-radius: 4px; }'
+            'QPlainTextEdit { padding: 6px 8px; border: 1px solid #bbb; border-radius: 4px; '
+            'margin-top: 0px; margin-bottom: 0px; }'
         )
-        self._plain.hide()
-        root.addWidget(self._plain)
+        self._plain.setSizePolicy(
+            QSizePolicy.Policy.Preferred,
+            QSizePolicy.Policy.Fixed,
+        )
+        self._editor_stack = StackedSizeToCurrentWidget()
+        self._editor_stack.addWidget(self._line_edit)
+        self._editor_stack.addWidget(self._plain)
+        self._editor_stack.setSizePolicy(
+            QSizePolicy.Policy.Preferred,
+            QSizePolicy.Policy.Fixed,
+        )
+        self._editor_stack.setContentsMargins(0, 0, 0, 0)
+
+        # Isolate crop ↔ editor gap at 4px (avoid root column spacing stacking with style margins).
+        crop_editor = QVBoxLayout()
+        crop_editor.setSpacing(4)
+        crop_editor.setContentsMargins(0, 0, 0, 0)
+        crop_editor.addWidget(self._crop_label, alignment=Qt.AlignmentFlag.AlignLeft)
+        crop_editor.addWidget(self._editor_stack, alignment=Qt.AlignmentFlag.AlignLeft)
+        root.addLayout(crop_editor)
 
         btn_row = QHBoxLayout()
         self._btn_prev = QPushButton('◀ Prev')
@@ -459,7 +548,7 @@ class ReviewMainWindow(QMainWindow):
     def _commit_current(self) -> None:
         """Write the active editor’s text into ``payload['lines'][idx]`` for the current review index."""
         idx = self._review_indices[self._ridx]
-        if self._plain.isVisible():
+        if self._editor_stack.currentIndex() == 1:
             self._lines[idx]['text'] = rstrip_line_text(self._plain.toPlainText())
         else:
             self._lines[idx]['text'] = rstrip_line_text(self._line_edit.text())
@@ -518,8 +607,7 @@ class ReviewMainWindow(QMainWindow):
         multiline = '\n' in text
         if multiline:
             self._plain.setPlainText(text)
-            self._plain.show()
-            self._line_edit.hide()
+            self._editor_stack.setCurrentIndex(1)
             px = estimate_transcription_font_px(
                 text,
                 self._raw_crop.width if self._raw_crop else None,
@@ -530,8 +618,7 @@ class ReviewMainWindow(QMainWindow):
             self._plain.setFont(pf)
         else:
             self._line_edit.setText(text)
-            self._line_edit.show()
-            self._plain.hide()
+            self._editor_stack.setCurrentIndex(0)
 
         self._btn_prev.setEnabled(self._ridx > 0)
         self._btn_next.setEnabled(self._ridx < n_review - 1)
@@ -561,12 +648,13 @@ class ReviewMainWindow(QMainWindow):
         # Same pixel width for crop QLabel and editors so columns align (no independent stretch).
         self._line_edit.setFixedWidth(scaled.width())
         self._plain.setFixedWidth(scaled.width())
-        if self._line_edit.isVisible():
+        self._editor_stack.setFixedWidth(scaled.width())
+        if self._editor_stack.currentIndex() == 0:
             self._fit_editor_font_only()
 
     def _fit_editor_font_only(self) -> None:
         """Recompute single-line font size from the line edit’s current width minus padding fudge."""
-        if not self._line_edit.isVisible():
+        if self._editor_stack.currentIndex() != 0:
             return
         # ~8px margin per side for stylesheet padding + frame; keeps text from touching the border.
         inner = max(80, self._line_edit.width() - 16)
