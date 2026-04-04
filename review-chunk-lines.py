@@ -152,28 +152,58 @@ def clamp_box_2d_to_pixels(
     width: int,
     height: int,
 ) -> tuple[int, int, int, int]:
+    """Turn a model line box into a PIL crop rectangle in pixel coordinates.
+
+    Pass 1 stores ``box_2d`` as four integers ``[ymin, xmin, ymax, xmax]`` on a
+    0–1000 grid aligned to the rasterized page (same aspect as ``width`` × ``height``).
+    This function maps that box to ``(left, upper, right, lower)`` for ``Image.crop``,
+    where ``right`` and ``lower`` are **exclusive** Pillow indices (see Pillow docs).
+
+    Steps: scale to pixels → clamp to the page (model noise / rounding can sit on or
+    outside edges) → ensure a non-empty box → add a little padding so ascenders,
+    descenders, and side bearings are not clipped → clamp again after padding.
+
+    Padding is derived from the **box size**, not the full page, so tall raster pages
+    do not add huge strips that pull in the next line.
+    """
     ymin, xmin, ymax, xmax = (int(box_2d[0]), int(box_2d[1]), int(box_2d[2]), int(box_2d[3]))
+
+    # Map normalized 0–1000 edges to pixel columns/rows on this page image.
     left = int(round(xmin / 1000.0 * width))
     upper = int(round(ymin / 1000.0 * height))
     right = int(round(xmax / 1000.0 * width))
     lower = int(round(ymax / 1000.0 * height))
+
+    # Clamp every edge into the image bounds. The model can overshoot slightly, or
+    # rounding can land past the last row/column; without this, PIL gets invalid boxes.
+    # Using ``min(..., width)`` / ``min(..., height)`` allows exclusive right/lower to
+    # reach ``width`` / ``height``, which is valid for a full-bleed crop.
     left = max(0, min(left, width))
     right = max(0, min(right, width))
     upper = max(0, min(upper, height))
     lower = max(0, min(lower, height))
+
+    # Collapsed or inverted box (e.g. bad model output): force a 1×1 region inside the page.
     if right <= left:
         right = min(width, left + 1)
     if lower <= upper:
         lower = min(height, upper + 1)
+
     box_h = lower - upper
     box_w = right - left
+
+    # Expand the rect slightly. Amounts scale with the line box so we do not add
+    # page-sized padding on tall DPI rasters (which would include the next line).
     pad_top = min(8, max(0, box_h // 14))
     pad_bot = min(28, max(3, box_h // 5 + 2))
     pad_x = min(24, max(1, box_w // 50 + 1))
+
     left = max(0, left - pad_x)
     upper = max(0, upper - pad_top)
     right = min(width, right + pad_x)
     lower = min(height, lower + pad_bot)
+
+    # Padding can push an edge back across a corner case; enforce non-empty again.
     if right <= left:
         right = min(width, left + 1)
     if lower <= upper:
@@ -182,9 +212,18 @@ def clamp_box_2d_to_pixels(
 
 
 def estimate_transcription_font_px(text: str, crop_width: int | None) -> int:
+    """Rough initial ``QFont`` pixel size for multiline editor rows (not used for single-line fit).
+
+    Single-line fields get ``fit_line_edit_font`` after layout. This helper only seeds
+    ``QPlainTextEdit`` when the JSON line contains newlines, where we do not run the
+    metric binary search. Heuristic: wider crops and shorter strings → larger px, capped
+    so the first paint is in a sane range before any user interaction.
+    """
     t = text.rstrip() if isinstance(text, str) else text
     n = max(len(t), 1)
+    # Nominal column width for the heuristic (crop width, clamped so tiny/huge crops behave).
     w = min(1100, max(crop_width or 640, 320))
+    # Empirical divisor ~chars-per-em at the target density; result clamped for readability.
     return max(13, min(160, int(w / (n * 0.48))))
 
 
@@ -210,6 +249,12 @@ def save_payload(path: Path, payload: dict) -> None:
 
 
 def pil_to_qpixmap(im: Image.Image) -> QPixmap:
+    """Convert a Pillow image to a ``QPixmap`` for ``QLabel`` without writing temp files.
+
+    Builds a tightly packed RGB888 buffer: **bytes per line** = 3 × width (no row padding).
+    ``QImage`` is created from those bytes, then copied into a ``QPixmap`` for display.
+    """
+    # Qt does not handle palette/LA/etc. uniformly for this path; normalize to 8-bit RGB.
     if im.mode != 'RGB':
         im = im.convert('RGB')
     w, h = im.size
@@ -220,6 +265,12 @@ def pil_to_qpixmap(im: Image.Image) -> QPixmap:
 
 
 def fit_line_edit_font(line_edit: QLineEdit, max_text_width: int) -> None:
+    """Set the largest pixel font size so the full line fits in ``max_text_width`` pixels.
+
+    ``max_text_width`` should match the drawable text width inside the field (roughly widget
+    width minus padding and frame). Uses integer pixel sizes and ``QFontMetrics.horizontalAdvance``
+    for the whole string so the transcription line visually matches the crop width above.
+    """
     text = line_edit.text()
     font = QFont(line_edit.font())
     font.setStyleHint(QFont.SansSerif)
@@ -227,6 +278,7 @@ def fit_line_edit_font(line_edit: QLineEdit, max_text_width: int) -> None:
         font.setPixelSize(12)
         line_edit.setFont(font)
         return
+    # Binary search on pixel size: largest size such that rendered width <= budget.
     lo, hi = 8, 400
     best = 8
     while lo <= hi:
@@ -243,6 +295,8 @@ def fit_line_edit_font(line_edit: QLineEdit, max_text_width: int) -> None:
 
 
 class ReviewMainWindow(QMainWindow):
+    """Main window: one reviewable line at a time — crop image, editor, prev/next/save/reload."""
+
     def __init__(
         self,
         paths: ReviewPaths,
@@ -253,6 +307,7 @@ class ReviewMainWindow(QMainWindow):
         self._paths = paths
         self.setWindowTitle(f'Line review — {paths.chunk_name}')
         self.resize(880, 620)
+        # Optional preloaded raster avoids double pdf2image work when main() already validated Poppler.
         self._page_images = page_images if page_images is not None else load_page_images(
             paths.chunk_pdf_path,
         )
@@ -273,6 +328,7 @@ class ReviewMainWindow(QMainWindow):
         self._crop_pixmap: QPixmap | None = None
         self._raw_crop: Image.Image | None = None
 
+        # UI: caption, optional skip notice, crop QLabel, single-line QLineEdit vs multiline plain.
         central = QWidget()
         self.setCentralWidget(central)
         root = QVBoxLayout(central)
@@ -347,16 +403,20 @@ class ReviewMainWindow(QMainWindow):
 
     def resizeEvent(self, event) -> None:
         super().resizeEvent(event)
+        # Defer rescale until after layout has the new size; singleShot(0) runs next event-loop tick.
         QTimer.singleShot(0, self._apply_crop_scale_and_font)
 
     def _schedule_fit_font(self) -> None:
+        """Coalesce rapid keystrokes: refit font once the line edit has settled for this tick."""
         QTimer.singleShot(0, self._fit_editor_font_only)
 
     def _max_crop_display_width(self) -> int:
+        """Max width for the scaled crop (and matching editor), so huge scans don't overflow the window."""
         w = self.centralWidget().width() if self.centralWidget() else 800
         return max(320, min(1000, w - 32))
 
     def _commit_current(self) -> None:
+        """Write the active editor’s text into ``payload['lines'][idx]`` for the current review index."""
         idx = self._review_indices[self._ridx]
         if self._plain.isVisible():
             self._lines[idx]['text'] = rstrip_line_text(self._plain.toPlainText())
@@ -364,6 +424,12 @@ class ReviewMainWindow(QMainWindow):
             self._lines[idx]['text'] = rstrip_line_text(self._line_edit.text())
 
     def _show_line(self) -> None:
+        """Load ``self._ridx`` into the UI: crop from PDF page, labels, and editor text.
+
+        Does not commit the previous line — callers must ``_commit_current`` before changing
+        ``_ridx`` (navigation buttons do that). Schedules ``_apply_crop_scale_and_font`` so
+        pixmap scaling and font fit run after the widget has a real width.
+        """
         n_review = len(self._review_indices)
         self._ridx = max(0, min(self._ridx, n_review - 1))
         idx = self._review_indices[self._ridx]
@@ -382,6 +448,7 @@ class ReviewMainWindow(QMainWindow):
 
         n_pages = len(self._page_images)
         err: str | None = None
+        # Validate JSON line, then crop the page image; on failure show message and skip pixmap.
         if not isinstance(page_number, int) or page_number < 1:
             err = f'Invalid page_number: {page_number!r}'
         elif page_number > n_pages:
@@ -405,6 +472,7 @@ class ReviewMainWindow(QMainWindow):
         self._page_lbl.setText(f'Page {pn}')
         self._line_lbl.setText(f'Line {self._ridx + 1} / {n_review}')
 
+        # Multiline JSON lines use a fixed-height plain editor with a heuristic font only.
         multiline = '\n' in text
         if multiline:
             self._plain.setPlainText(text)
@@ -429,6 +497,11 @@ class ReviewMainWindow(QMainWindow):
         QTimer.singleShot(0, self._apply_crop_scale_and_font)
 
     def _apply_crop_scale_and_font(self) -> None:
+        """Scale the crop to fit the window, match editor width to the **scaled** image, refit font.
+
+        Called after resize and after showing a new line so ``QLabel`` and ``QLineEdit`` share
+        one column width (visual alignment between bitmap and transcription).
+        """
         if self._raw_crop is None or self._crop_pixmap is None or self._crop_pixmap.isNull():
             return
         max_w = self._max_crop_display_width()
@@ -449,12 +522,15 @@ class ReviewMainWindow(QMainWindow):
             self._fit_editor_font_only()
 
     def _fit_editor_font_only(self) -> None:
+        """Recompute single-line font size from the line edit’s current width minus padding fudge."""
         if not self._line_edit.isVisible():
             return
+        # ~8px margin per side for stylesheet padding + frame; keeps text from touching the border.
         inner = max(80, self._line_edit.width() - 16)
         fit_line_edit_font(self._line_edit, inner)
 
     def _on_prev(self) -> None:
+        """Persist current line, then move to the previous reviewable index."""
         if self._ridx <= 0:
             return
         self._commit_current()
@@ -462,6 +538,7 @@ class ReviewMainWindow(QMainWindow):
         self._show_line()
 
     def _on_next(self) -> None:
+        """Persist current line, then move to the next reviewable index."""
         if self._ridx >= len(self._review_indices) - 1:
             return
         self._commit_current()
@@ -469,11 +546,13 @@ class ReviewMainWindow(QMainWindow):
         self._show_line()
 
     def _on_save(self) -> None:
+        """Flush editor text to payload and write ``*_final.json``."""
         self._commit_current()
         save_payload(self._final_path, self._payload)
         self.statusBar().showMessage(f'Wrote {self._final_path}', 6000)
 
     def _on_reload(self) -> None:
+        """Optional: re-read raw JSON from disk and reset review state (after confirmation)."""
         self._commit_current()
         reply = QMessageBox.question(
             self,
