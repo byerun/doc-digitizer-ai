@@ -10,6 +10,11 @@ Requires Poppler (system) for pdf2image — see README.md.
   python review-chunk-lines.py --working-dir <dir> --chunk-pdf <file.pdf>
 
 Optional: ``--raw-json`` (defaults to ``transcriptions/<stem>_raw.json`` under the working dir).
+
+**Editing this file:** Skim the ``# ---`` block below imports for data flow and UI split. JSON
+shape matches Pass 1 output (see ``transcription.schema.json`` / ``prompt.md``). Crop math is
+isolated in ``clamp_box_2d_to_pixels``; Qt layout and font fitting in ``ReviewMainWindow`` and
+``fit_line_edit_font``. ``main()`` wires CLI → validate paths → rasterize once → window.
 """
 
 from __future__ import annotations
@@ -38,7 +43,21 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+# --- Architecture (quick map for future changes) ---
+# Data: ``payload['lines']`` is the full Pass 1/2 list. ``reviewable_line_indices`` skips
+#   synthetic ``// Page N`` markers (see ``_PAGE_MARKER_PATTERN``); UI index ``_ridx`` walks
+#   *that* subset only. Saving always writes the whole ``payload`` to ``*_final.json``.
+# Raster: ``_page_images[i]`` is PIL RGB for chunk page i+1; crops use ``clamp_box_2d_to_pixels``
+#   then ``Image.crop`` → ``pil_to_qpixmap`` for the QLabel.
+# Editors: Default path is single-line ``QLineEdit`` + ``fit_line_edit_font`` (binary search on
+#   pixel size vs ``QFontMetrics.horizontalAdvance``). If ``'\\n' in text``, multiline
+#   ``QPlainTextEdit`` + ``estimate_transcription_font_px`` only (no per-keystroke refit).
+# Layout: Crop and editor widths are forced equal after optional ``scaledToWidth`` so the text
+#   column lines up under the bitmap; resize uses ``QTimer.singleShot(0, ...)`` to run after
+#   geometry is known.
+
 # Prompt-injected markers (not printed on the page); skip in the review UI.
+# Must stay aligned with Pass 1 prompt / any transcribe normalization of line text.
 _PAGE_MARKER_PATTERN = re.compile(r'^\s*//\s*Page\s+\d+\s*$', re.IGNORECASE)
 
 
@@ -52,6 +71,7 @@ def is_injected_page_marker(text: object) -> bool:
 
 
 def reviewable_line_indices(lines: list) -> list[int]:
+    # Indices into ``payload['lines']`` for rows the human should edit (markers still in JSON).
     return [i for i, ln in enumerate(lines) if not is_injected_page_marker(ln.get('text', ''))]
 
 
@@ -61,6 +81,7 @@ def parse_cli_args(argv: list[str] | None = None) -> argparse.Namespace | None:
     if not argv:
         return None
 
+    # Keep flags compatible with README examples; ``main()`` requires ``--chunk-pdf``.
     parser = argparse.ArgumentParser(
         description='Review and correct per-line transcriptions for a chunk PDF.',
     )
@@ -92,6 +113,7 @@ def parse_cli_args(argv: list[str] | None = None) -> argparse.Namespace | None:
 
 @dataclass(frozen=True)
 class ReviewPaths:
+    # Resolved absolute paths for the chunk PDF and JSON; ``stem`` is chunk filename without .pdf.
     working_dir: Path
     chunk_pdf_path: Path
     raw_path: Path
@@ -137,6 +159,7 @@ def resolve_review_paths(cli: argparse.Namespace) -> ReviewPaths | str:
     if not raw_path.is_file():
         return f'Raw JSON not found: {raw_path}'
 
+    # ``final_path`` is not required to exist; ``load_payload`` prefers it when present.
     return ReviewPaths(
         working_dir=working_dir,
         chunk_pdf_path=chunk_pdf_path,
@@ -228,16 +251,19 @@ def estimate_transcription_font_px(text: str, crop_width: int | None) -> int:
 
 
 def rstrip_line_text(value: object) -> object:
+    # Avoid trailing-space noise when saving; keeps diff noise down in ``*_final.json``.
     if isinstance(value, str):
         return value.rstrip()
     return value
 
 
 def load_page_images(pdf_path: Path) -> list[Image.Image]:
+    # One PIL image per page of the chunk PDF; DPI is pdf2image/poppler defaults unless changed.
     return convert_from_path(str(pdf_path))
 
 
 def load_payload(raw_path: Path, final_path: Path) -> dict:
+    # Resume editing: if a final file exists, load it instead of raw.
     if final_path.exists():
         return json.loads(final_path.read_text(encoding='utf-8'))
     return json.loads(raw_path.read_text(encoding='utf-8'))
@@ -297,6 +323,8 @@ def fit_line_edit_font(line_edit: QLineEdit, max_text_width: int) -> None:
 class ReviewMainWindow(QMainWindow):
     """Main window: one reviewable line at a time — crop image, editor, prev/next/save/reload."""
 
+    # State: ``_ridx`` indexes ``_review_indices``; ``_lines`` is alias to ``payload['lines']`` (mutated in place).
+
     def __init__(
         self,
         paths: ReviewPaths,
@@ -312,7 +340,7 @@ class ReviewMainWindow(QMainWindow):
             paths.chunk_pdf_path,
         )
         self._payload = load_payload(paths.raw_path, paths.final_path)
-        self._source_raw_path = str(paths.raw_path)
+        self._source_raw_path = str(paths.raw_path)  # Used only by Reload (re-read raw from disk).
         self._final_path = paths.final_path
         lines = self._payload.get('lines')
         if not isinstance(lines, list) or not lines:
@@ -366,6 +394,7 @@ class ReviewMainWindow(QMainWindow):
         self._crop_label.setAlignment(Qt.AlignLeft | Qt.AlignTop)
         root.addWidget(self._crop_label)
 
+        # Single-line path is default; ``_plain`` is for rare JSON lines with embedded newlines.
         self._line_edit = QLineEdit()
         self._line_edit.setStyleSheet(
             'QLineEdit { padding: 6px 8px; border: 1px solid #bbb; border-radius: 4px; }'
@@ -459,6 +488,7 @@ class ReviewMainWindow(QMainWindow):
         elif not isinstance(box_2d, list) or len(box_2d) != 4:
             err = f'Invalid box_2d: {box_2d!r}'
         else:
+            # ``page_number`` is 1-based in JSON; ``_page_images`` is 0-based.
             page_img = self._page_images[page_number - 1]
             w, h = page_img.size
             left, upper, right, lower = clamp_box_2d_to_pixels(box_2d, w, h)
@@ -516,6 +546,7 @@ class ReviewMainWindow(QMainWindow):
         self._crop_label.setPixmap(scaled)
         self._crop_label.setFixedWidth(scaled.width())
 
+        # Same pixel width for crop QLabel and editors so columns align (no independent stretch).
         self._line_edit.setFixedWidth(scaled.width())
         self._plain.setFixedWidth(scaled.width())
         if self._line_edit.isVisible():
@@ -563,6 +594,7 @@ class ReviewMainWindow(QMainWindow):
         )
         if reply != QMessageBox.Yes:
             return
+        # Rebuild from raw file on disk; discards in-memory edits and any ``*_final`` content not saved.
         self._payload = json.loads(
             Path(self._source_raw_path).read_text(encoding='utf-8'),
         )
@@ -576,6 +608,7 @@ class ReviewMainWindow(QMainWindow):
 
 
 def main() -> int:
+    # Exit codes: 2 = bad/missing CLI, 1 = path/validation/PDF/errors, 0 = normal Qt exit.
     cli = parse_cli_args()
     if cli is None:
         print(
@@ -599,6 +632,7 @@ def main() -> int:
 
     app = QApplication(sys.argv)
     try:
+        # Pass rasters in so we do not call pdf2image twice (here + window ctor).
         win = ReviewMainWindow(resolved, page_images=page_images)
     except ValueError as exc:
         print(str(exc), file=sys.stderr)
