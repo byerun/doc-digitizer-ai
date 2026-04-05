@@ -11,24 +11,16 @@ Requires Poppler (system) for pdf2image — see README.md.
 
 Optional: ``--raw-json`` (defaults to ``transcriptions/<stem>_raw.json`` under the working dir).
 
-**Editing this file:** Skim the ``# ---`` block below imports for data flow and UI split. JSON
-shape matches Pass 1 output (see ``transcription.schema.json`` / ``prompt.md``). Crop math is
-isolated in ``clamp_box_2d_to_pixels``; Qt layout and font fitting in ``ReviewMainWindow`` and
-``fit_line_edit_font``. ``main()`` validates ``--working-dir`` and opens the window; the first
-loadable chunk PDF is selected (or choose another from the dropdown).
+Domain logic lives in ``chunk_lines_model.py``; this file is View + Controller + entrypoint.
 """
 
 from __future__ import annotations
 
 import argparse
-import json
-import re
 import signal
 import sys
-from dataclasses import dataclass
 from pathlib import Path
 
-from pdf2image import convert_from_path
 from PIL import Image
 from PySide6.QtCore import Qt, QSize, QTimer
 from PySide6.QtGui import QFont, QFontMetrics, QIcon, QImage, QPixmap
@@ -49,6 +41,8 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from chunk_lines_model import ChunkLinesSession, list_chunk_pdf_filenames
+
 
 class StackedSizeToCurrentWidget(QStackedWidget):
     """``QStackedWidget`` uses the max of all pages' size hints; we only need the visible page."""
@@ -65,36 +59,56 @@ class StackedSizeToCurrentWidget(QStackedWidget):
         w = self.currentWidget()
         return w.minimumSizeHint() if w is not None else super().minimumSizeHint()
 
-# --- Architecture (quick map for future changes) ---
-# Data: ``payload['lines']`` is the full Pass 1/2 list. ``reviewable_line_indices`` skips
-#   synthetic ``// Page N`` markers (see ``_PAGE_MARKER_PATTERN``); UI index ``_ridx`` walks
-#   *that* subset only. Saving always writes the whole ``payload`` to ``*_final.json``.
-# Raster: ``_page_images[i]`` is PIL RGB for chunk page i+1; crops use ``clamp_box_2d_to_pixels``
-#   then ``Image.crop`` → ``pil_to_qpixmap`` for the QLabel.
-# Editors: Default path is single-line ``QLineEdit`` + ``fit_line_edit_font`` (binary search on
-#   pixel size vs ``QFontMetrics.horizontalAdvance``). If ``'\\n' in text``, multiline
-#   ``QPlainTextEdit`` + ``estimate_transcription_font_px`` only (no per-keystroke refit).
-# Layout: Crop and editor widths are forced equal after optional ``scaledToWidth`` so the text
-#   column lines up under the bitmap; resize uses ``QTimer.singleShot(0, ...)`` to run after
-#   geometry is known.
 
-# Prompt-injected markers (not printed on the page); skip in the review UI.
-# Must stay aligned with Pass 1 prompt / any transcribe normalization of line text.
-_PAGE_MARKER_PATTERN = re.compile(r'^\s*//\s*Page\s+\d+\s*$', re.IGNORECASE)
+def estimate_transcription_font_px(text: str, crop_width: int | None) -> int:
+    """Rough initial ``QFont`` pixel size for multiline editor rows (not used for single-line fit)."""
+    t = text.rstrip() if isinstance(text, str) else text
+    n = max(len(t), 1)
+    w = min(1100, max(crop_width or 640, 320))
+    return max(13, min(160, int(w / (n * 0.48))))
 
 
-def is_injected_page_marker(text: object) -> bool:
-    if not isinstance(text, str):
-        return False
-    t = text.strip()
-    if t.startswith('{empty}'):
-        t = t[len('{empty}') :].strip()
-    return bool(_PAGE_MARKER_PATTERN.match(t))
+def pil_to_qpixmap(im: Image.Image) -> QPixmap:
+    """Convert a Pillow image to a ``QPixmap`` for ``QLabel`` without writing temp files."""
+    if im.mode != 'RGB':
+        im = im.convert('RGB')
+    w, h = im.size
+    bpl = 3 * w
+    buf = im.tobytes('raw', 'RGB')
+    qimg = QImage(buf, w, h, bpl, QImage.Format.Format_RGB888)
+    return QPixmap.fromImage(qimg)
 
 
-def reviewable_line_indices(lines: list) -> list[int]:
-    # Indices into ``payload['lines']`` for rows the human should edit (markers still in JSON).
-    return [i for i, ln in enumerate(lines) if not is_injected_page_marker(ln.get('text', ''))]
+def fit_line_edit_font(line_edit: QLineEdit, max_text_width: int) -> None:
+    """Set the largest pixel font size so the full line fits in ``max_text_width`` pixels."""
+    text = line_edit.text()
+    font = QFont(line_edit.font())
+    font.setStyleHint(QFont.SansSerif)
+    if not text:
+        font.setPixelSize(12)
+        line_edit.setFont(font)
+        return
+    lo, hi = 8, 400
+    best = 8
+    while lo <= hi:
+        mid = (lo + hi) // 2
+        font.setPixelSize(mid)
+        fm = QFontMetrics(font)
+        if fm.horizontalAdvance(text) <= max_text_width:
+            best = mid
+            lo = mid + 1
+        else:
+            hi = mid - 1
+    font.setPixelSize(best)
+    line_edit.setFont(font)
+
+
+def _review_app_icon() -> QIcon:
+    """Window icon: ``icons/review-chunk-lines.png`` beside this script (optional file)."""
+    p = Path(__file__).resolve().parent / 'icons' / 'review-chunk-lines.png'
+    if p.is_file():
+        return QIcon(str(p))
+    return QIcon()
 
 
 def parse_cli_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -124,272 +138,27 @@ def parse_cli_args(argv: list[str] | None = None) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
-def list_chunk_pdf_filenames(chunk_dir: Path) -> list[str]:
-    if not chunk_dir.exists() or not chunk_dir.is_dir():
-        return []
-    return sorted(
-        p.name
-        for p in chunk_dir.iterdir()
-        if p.is_file() and p.suffix.lower() == '.pdf'
-    )
-
-
-@dataclass(frozen=True)
-class ReviewPaths:
-    # Resolved absolute paths for the chunk PDF and JSON; ``stem`` is chunk filename without .pdf.
-    working_dir: Path
-    chunk_pdf_path: Path
-    raw_path: Path
-    final_path: Path
-    chunk_name: str
-    stem: str
-
-
-def resolve_review_paths_for_chunk(
-    working_dir: Path,
-    chunk_name: str,
-    raw_json: Path | None,
-) -> ReviewPaths | str:
-    working_dir = working_dir.resolve()
-    chunk_pdfs_dir = working_dir / 'chunk-pdfs'
-    transcriptions_dir = working_dir / 'transcriptions'
-    if not chunk_pdfs_dir.is_dir():
-        return (
-            f'Expected a chunk-pdfs directory at {chunk_pdfs_dir}. '
-            '--working-dir should be the project/work folder that contains '
-            'chunk-pdfs/ (and usually transcriptions/), same as '
-            'transcribe-chunk-pdf.py.'
-        )
-
-    chunk_name = chunk_name.strip()
-    if Path(chunk_name).name != chunk_name:
-        return 'Use chunk PDF filename only, not a path.'
-    if not chunk_name.lower().endswith('.pdf'):
-        return "Chunk PDF filename must end with '.pdf'."
-
-    chunk_pdf_path = chunk_pdfs_dir / chunk_name
-    if not chunk_pdf_path.is_file():
-        return f'Chunk PDF not found: {chunk_pdf_path}'
-
-    stem = Path(chunk_name).stem
-    if raw_json is not None:
-        raw_candidate = raw_json
-        raw_path = (
-            (working_dir / raw_candidate).resolve()
-            if not raw_candidate.is_absolute()
-            else raw_candidate.resolve()
-        )
-    else:
-        raw_path = transcriptions_dir / f'{stem}_raw.json'
-    final_path = transcriptions_dir / f'{stem}_final.json'
-
-    if not raw_path.is_file():
-        return f'Raw JSON not found: {raw_path}'
-
-    # ``final_path`` is not required to exist; ``load_payload`` prefers it when present.
-    return ReviewPaths(
-        working_dir=working_dir,
-        chunk_pdf_path=chunk_pdf_path,
-        raw_path=raw_path,
-        final_path=final_path,
-        chunk_name=chunk_name,
-        stem=stem,
-    )
-
-
-def clamp_box_2d_to_pixels(
-    box_2d: list,
-    width: int,
-    height: int,
-) -> tuple[int, int, int, int]:
-    """Turn a model line box into a PIL crop rectangle in pixel coordinates.
-
-    Pass 1 stores ``box_2d`` as four integers ``[ymin, xmin, ymax, xmax]`` on a
-    0–1000 grid aligned to the rasterized page (same aspect as ``width`` × ``height``).
-    This function maps that box to ``(left, upper, right, lower)`` for ``Image.crop``,
-    where ``right`` and ``lower`` are **exclusive** Pillow indices (see Pillow docs).
-
-    Steps: scale to pixels → clamp to the page (model noise / rounding can sit on or
-    outside edges) → ensure a non-empty box → add a little padding so ascenders,
-    descenders, and side bearings are not clipped → clamp again after padding.
-
-    Padding is derived from the **box size**, not the full page, so tall raster pages
-    do not add huge strips that pull in the next line.
-    """
-    ymin, xmin, ymax, xmax = (int(box_2d[0]), int(box_2d[1]), int(box_2d[2]), int(box_2d[3]))
-
-    # Map normalized 0–1000 edges to pixel columns/rows on this page image.
-    left = int(round(xmin / 1000.0 * width))
-    upper = int(round(ymin / 1000.0 * height))
-    right = int(round(xmax / 1000.0 * width))
-    lower = int(round(ymax / 1000.0 * height))
-
-    # Clamp every edge into the image bounds. The model can overshoot slightly, or
-    # rounding can land past the last row/column; without this, PIL gets invalid boxes.
-    # Using ``min(..., width)`` / ``min(..., height)`` allows exclusive right/lower to
-    # reach ``width`` / ``height``, which is valid for a full-bleed crop.
-    left = max(0, min(left, width))
-    right = max(0, min(right, width))
-    upper = max(0, min(upper, height))
-    lower = max(0, min(lower, height))
-
-    # Collapsed or inverted box (e.g. bad model output): force a 1×1 region inside the page.
-    if right <= left:
-        right = min(width, left + 1)
-    if lower <= upper:
-        lower = min(height, upper + 1)
-
-    box_h = lower - upper
-    box_w = right - left
-
-    # Expand the rect slightly. Amounts scale with the line box so we do not add
-    # page-sized padding on tall DPI rasters (which would include the next line).
-    pad_top = min(8, max(0, box_h // 14))
-    pad_bot = min(28, max(3, box_h // 5 + 2))
-    pad_x = min(24, max(1, box_w // 50 + 1))
-
-    left = max(0, left - pad_x)
-    upper = max(0, upper - pad_top)
-    right = min(width, right + pad_x)
-    lower = min(height, lower + pad_bot)
-
-    # Padding can push an edge back across a corner case; enforce non-empty again.
-    if right <= left:
-        right = min(width, left + 1)
-    if lower <= upper:
-        lower = min(height, upper + 1)
-    return left, upper, right, lower
-
-
-def estimate_transcription_font_px(text: str, crop_width: int | None) -> int:
-    """Rough initial ``QFont`` pixel size for multiline editor rows (not used for single-line fit).
-
-    Single-line fields get ``fit_line_edit_font`` after layout. This helper only seeds
-    ``QPlainTextEdit`` when the JSON line contains newlines, where we do not run the
-    metric binary search. Heuristic: wider crops and shorter strings → larger px, capped
-    so the first paint is in a sane range before any user interaction.
-    """
-    t = text.rstrip() if isinstance(text, str) else text
-    n = max(len(t), 1)
-    # Nominal column width for the heuristic (crop width, clamped so tiny/huge crops behave).
-    w = min(1100, max(crop_width or 640, 320))
-    # Empirical divisor ~chars-per-em at the target density; result clamped for readability.
-    return max(13, min(160, int(w / (n * 0.48))))
-
-
-def rstrip_line_text(value: object) -> object:
-    # Avoid trailing-space noise when saving; keeps diff noise down in ``*_final.json``.
-    if isinstance(value, str):
-        return value.rstrip()
-    return value
-
-
-def load_page_images(pdf_path: Path) -> list[Image.Image]:
-    # One PIL image per page of the chunk PDF; DPI is pdf2image/poppler defaults unless changed.
-    return convert_from_path(str(pdf_path))
-
-
-def load_payload(raw_path: Path, final_path: Path) -> dict:
-    # Resume editing: if a final file exists, load it instead of raw.
-    if final_path.exists():
-        return json.loads(final_path.read_text(encoding='utf-8'))
-    return json.loads(raw_path.read_text(encoding='utf-8'))
-
-
-def save_payload(path: Path, payload: dict) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(payload, indent=2, ensure_ascii=False) + '\n', encoding='utf-8')
-
-
-def _review_app_icon() -> QIcon:
-    """Window icon: ``icons/review-chunk-lines.png`` beside this script (optional file)."""
-    p = Path(__file__).resolve().parent / 'icons' / 'review-chunk-lines.png'
-    if p.is_file():
-        return QIcon(str(p))
-    return QIcon()
-
-
-def pil_to_qpixmap(im: Image.Image) -> QPixmap:
-    """Convert a Pillow image to a ``QPixmap`` for ``QLabel`` without writing temp files.
-
-    Builds a tightly packed RGB888 buffer: **bytes per line** = 3 × width (no row padding).
-    ``QImage`` is created from those bytes, then copied into a ``QPixmap`` for display.
-    """
-    # Qt does not handle palette/LA/etc. uniformly for this path; normalize to 8-bit RGB.
-    if im.mode != 'RGB':
-        im = im.convert('RGB')
-    w, h = im.size
-    bpl = 3 * w
-    buf = im.tobytes('raw', 'RGB')
-    qimg = QImage(buf, w, h, bpl, QImage.Format.Format_RGB888)
-    return QPixmap.fromImage(qimg)
-
-
-def fit_line_edit_font(line_edit: QLineEdit, max_text_width: int) -> None:
-    """Set the largest pixel font size so the full line fits in ``max_text_width`` pixels.
-
-    ``max_text_width`` should match the drawable text width inside the field (roughly widget
-    width minus padding and frame). Uses integer pixel sizes and ``QFontMetrics.horizontalAdvance``
-    for the whole string so the transcription line visually matches the crop width above.
-    """
-    text = line_edit.text()
-    font = QFont(line_edit.font())
-    font.setStyleHint(QFont.SansSerif)
-    if not text:
-        font.setPixelSize(12)
-        line_edit.setFont(font)
-        return
-    # Binary search on pixel size: largest size such that rendered width <= budget.
-    lo, hi = 8, 400
-    best = 8
-    while lo <= hi:
-        mid = (lo + hi) // 2
-        font.setPixelSize(mid)
-        fm = QFontMetrics(font)
-        if fm.horizontalAdvance(text) <= max_text_width:
-            best = mid
-            lo = mid + 1
-        else:
-            hi = mid - 1
-    font.setPixelSize(best)
-    line_edit.setFont(font)
-
-
 class ReviewMainWindow(QMainWindow):
-    """Main window: one reviewable line at a time — crop image, editor, prev/next/save/reload."""
-
-    # State: ``_ridx`` indexes ``_review_indices``; ``_lines`` is alias to ``payload['lines']`` (mutated in place).
+    """View: chunk selector, crop, editors, navigation — no transcription domain logic."""
 
     def __init__(
         self,
         working_dir: Path,
         chunk_pdf_names: list[str],
-        raw_json: Path | None = None,
         parent: QWidget | None = None,
     ) -> None:
         super().__init__(parent)
         self._working_dir = working_dir.resolve()
         self._chunk_pdf_names = chunk_pdf_names
-        self._raw_json_cli = raw_json
-        self._paths: ReviewPaths | None = None
-        self._loaded_chunk_name: str | None = None
-        self._dirty = False
-        self._page_images: list = []
-        self._payload: dict = {}
-        self._source_raw_path = ''
-        self._final_path = Path()
-        self._lines: list = []
-        self._review_indices: list[int] = []
+        self._crop_pixmap: QPixmap | None = None
+        self._raw_crop: Image.Image | None = None
+
         self.setWindowTitle('Line review')
         _ic = _review_app_icon()
         if not _ic.isNull():
             self.setWindowIcon(_ic)
         self.resize(880, 480)
-        self._ridx = 0
-        self._crop_pixmap: QPixmap | None = None
-        self._raw_crop: Image.Image | None = None
 
-        # UI: caption, optional skip notice, crop QLabel, single-line QLineEdit vs multiline plain.
         central = QWidget()
         self.setCentralWidget(central)
         central.setSizePolicy(
@@ -478,7 +247,6 @@ class ReviewMainWindow(QMainWindow):
             QSizePolicy.Policy.Maximum,
         )
 
-        # Single-line path is default; ``_plain`` is for rare JSON lines with embedded newlines.
         self._line_edit = QLineEdit()
         self._line_edit.setStyleSheet(
             'QLineEdit { padding: 6px 8px; border: 1px solid #bbb; border-radius: 4px; '
@@ -508,7 +276,6 @@ class ReviewMainWindow(QMainWindow):
         )
         self._editor_stack.setContentsMargins(0, 0, 0, 0)
 
-        # Isolate crop ↔ editor gap at 4px (avoid root column spacing stacking with style margins).
         crop_editor = QVBoxLayout()
         crop_editor.setSpacing(4)
         crop_editor.setContentsMargins(0, 0, 0, 0)
@@ -528,132 +295,47 @@ class ReviewMainWindow(QMainWindow):
         btn_row.addStretch()
         root.addLayout(btn_row)
 
-        self._btn_prev.clicked.connect(self._on_prev)
-        self._btn_next.clicked.connect(self._on_next)
-        self._btn_save.clicked.connect(self._on_save)
-        self._btn_reload.clicked.connect(self._on_reload)
-        self._line_edit.textChanged.connect(self._on_line_edit_changed)
-        self._plain.textChanged.connect(self._on_plain_changed)
-        self._chunk_combo.currentIndexChanged.connect(self._on_chunk_combo_index_changed)
+        self.set_review_controls_enabled(False)
 
-        self._set_review_controls_enabled(False)
-        self._try_initial_chunk()
+    @property
+    def working_dir(self) -> Path:
+        return self._working_dir
 
-    def _set_review_controls_enabled(self, enabled: bool) -> None:
-        self._btn_prev.setEnabled(enabled)
-        self._btn_next.setEnabled(enabled)
-        self._btn_save.setEnabled(enabled)
-        self._btn_reload.setEnabled(enabled)
-        self._line_edit.setEnabled(enabled)
-        self._plain.setEnabled(enabled)
-        self._crop_label.setEnabled(enabled)
+    @property
+    def chunk_pdf_names(self) -> list[str]:
+        return self._chunk_pdf_names
 
-    def _on_line_edit_changed(self) -> None:
-        self._dirty = True
-        self._schedule_fit_font()
+    @property
+    def chunk_combo(self) -> QComboBox:
+        return self._chunk_combo
 
-    def _on_plain_changed(self) -> None:
-        self._dirty = True
-        self._schedule_fit_font()
+    def connect_controller_signals(self, ctrl: 'ReviewChunkLinesController') -> None:
+        self._chunk_combo.currentIndexChanged.connect(ctrl._on_chunk_combo_index_changed)
+        self._btn_prev.clicked.connect(ctrl._on_prev)
+        self._btn_next.clicked.connect(ctrl._on_next)
+        self._btn_save.clicked.connect(ctrl._on_save)
+        self._btn_reload.clicked.connect(ctrl._on_reload)
+        self._line_edit.textChanged.connect(ctrl._on_text_changed)
+        self._plain.textChanged.connect(ctrl._on_text_changed)
 
-    def _sync_combo_to_loaded_chunk(self) -> None:
-        if self._loaded_chunk_name is None:
+    def max_crop_display_width(self) -> int:
+        w = self.centralWidget().width() if self.centralWidget() else 800
+        return max(320, min(1000, w - 32))
+
+    def sync_combo_to_chunk_name(self, chunk_name: str | None) -> None:
+        if chunk_name is None:
             return
-        idx = self._chunk_combo.findText(self._loaded_chunk_name)
+        idx = self._chunk_combo.findText(chunk_name)
         if idx >= 0:
             self._chunk_combo.blockSignals(True)
             self._chunk_combo.setCurrentIndex(idx)
             self._chunk_combo.blockSignals(False)
 
-    def _on_chunk_combo_index_changed(self, index: int) -> None:
-        if index < 0:
-            return
-        name = self._chunk_combo.itemText(index)
-        if self._paths is not None and name == self._paths.chunk_name:
-            return
-        self._switch_to_chunk(name)
+    def set_path_labels(self, raw_name: str, final_name: str) -> None:
+        self._raw_path_lbl.setText(raw_name)
+        self._final_path_lbl.setText(final_name)
 
-    def _switch_to_chunk(self, chunk_name: str) -> None:
-        if self._paths is not None and self._dirty:
-            box = QMessageBox(self)
-            box.setWindowTitle('Unsaved changes')
-            box.setText('You have unsaved edits for this chunk.')
-            box.setInformativeText('Save them before opening another chunk?')
-            box.setStandardButtons(
-                QMessageBox.Save | QMessageBox.Discard | QMessageBox.Cancel,
-            )
-            box.setDefaultButton(QMessageBox.Save)
-            reply = box.exec()
-            if reply == QMessageBox.Cancel:
-                self._sync_combo_to_loaded_chunk()
-                return
-            if reply == QMessageBox.Save:
-                self._commit_current()
-                save_payload(self._final_path, self._payload)
-                self._dirty = False
-        if not self._load_chunk(chunk_name, show_error=True):
-            self._sync_combo_to_loaded_chunk()
-
-    def _try_initial_chunk(self) -> None:
-        for name in self._chunk_pdf_names:
-            if self._load_chunk(name, show_error=False):
-                self._sync_combo_to_loaded_chunk()
-                return
-        self._chunk_combo.setCurrentIndex(0)
-        self._load_chunk(self._chunk_pdf_names[0], show_error=True)
-
-    def _load_chunk(self, chunk_name: str, show_error: bool) -> bool:
-        resolved = resolve_review_paths_for_chunk(
-            self._working_dir,
-            chunk_name,
-            self._raw_json_cli,
-        )
-        if isinstance(resolved, str):
-            if show_error:
-                QMessageBox.warning(self, 'Cannot load chunk', resolved)
-            return False
-        try:
-            page_images = load_page_images(resolved.chunk_pdf_path)
-            payload = load_payload(resolved.raw_path, resolved.final_path)
-        except Exception as exc:
-            if show_error:
-                QMessageBox.warning(
-                    self,
-                    'Cannot load chunk',
-                    f'Could not read PDF or JSON. {exc}',
-                )
-            return False
-        lines = payload.get('lines')
-        if not isinstance(lines, list) or not lines:
-            msg = 'Invalid payload: missing or empty "lines"'
-            if show_error:
-                QMessageBox.warning(self, 'Cannot load chunk', msg)
-            return False
-        review_indices = reviewable_line_indices(lines)
-        if not review_indices:
-            msg = (
-                'No lines to review: every entry looks like a synthetic '
-                '`// Page N` marker.'
-            )
-            if show_error:
-                QMessageBox.warning(self, 'Cannot load chunk', msg)
-            return False
-
-        self._paths = resolved
-        self._loaded_chunk_name = resolved.chunk_name
-        self._page_images = page_images
-        self._payload = payload
-        self._source_raw_path = str(resolved.raw_path)
-        self._final_path = resolved.final_path
-        self._lines = lines
-        self._review_indices = review_indices
-        self._ridx = 0
-        self._dirty = False
-
-        self.setWindowTitle(f'Line review — {resolved.chunk_name}')
-        self._raw_path_lbl.setText(resolved.raw_path.name)
-        self._final_path_lbl.setText(resolved.final_path.name)
-        n_skip = len(lines) - len(review_indices)
+    def set_skip_notice_visible(self, n_skip: int) -> None:
         if n_skip:
             self._n_skip_lbl.setText(
                 f'Skipping {n_skip} synthetic page marker line(s) (`// Page …`). '
@@ -664,84 +346,38 @@ class ReviewMainWindow(QMainWindow):
             self._n_skip_lbl.clear()
             self._n_skip_lbl.hide()
 
-        self._set_review_controls_enabled(True)
-        self._show_line()
-        return True
+    def set_review_controls_enabled(self, enabled: bool) -> None:
+        self._btn_prev.setEnabled(enabled)
+        self._btn_next.setEnabled(enabled)
+        self._btn_save.setEnabled(enabled)
+        self._btn_reload.setEnabled(enabled)
+        self._line_edit.setEnabled(enabled)
+        self._plain.setEnabled(enabled)
+        self._crop_label.setEnabled(enabled)
 
-    def resizeEvent(self, event) -> None:
-        super().resizeEvent(event)
-        # Defer rescale until after layout has the new size; singleShot(0) runs next event-loop tick.
-        QTimer.singleShot(0, self._apply_crop_scale_and_font)
-
-    def _schedule_fit_font(self) -> None:
-        """Coalesce rapid keystrokes: refit font once the line edit has settled for this tick."""
-        QTimer.singleShot(0, self._fit_editor_font_only)
-
-    def _max_crop_display_width(self) -> int:
-        """Max width for the scaled crop (and matching editor), so huge scans don't overflow the window."""
-        w = self.centralWidget().width() if self.centralWidget() else 800
-        return max(320, min(1000, w - 32))
-
-    def _commit_current(self) -> None:
-        """Write the active editor’s text into ``payload['lines'][idx]`` for the current review index."""
-        idx = self._review_indices[self._ridx]
-        if self._editor_stack.currentIndex() == 1:
-            self._lines[idx]['text'] = rstrip_line_text(self._plain.toPlainText())
-        else:
-            self._lines[idx]['text'] = rstrip_line_text(self._line_edit.text())
-
-    def _show_line(self) -> None:
-        """Load ``self._ridx`` into the UI: crop from PDF page, labels, and editor text.
-
-        Does not commit the previous line — callers must ``_commit_current`` before changing
-        ``_ridx`` (navigation buttons do that). Schedules ``_apply_crop_scale_and_font`` so
-        pixmap scaling and font fit run after the widget has a real width.
-        """
-        n_review = len(self._review_indices)
-        self._ridx = max(0, min(self._ridx, n_review - 1))
-        idx = self._review_indices[self._ridx]
-        line = self._lines[idx]
-        page_number = line.get('page_number')
-        box_2d = line.get('box_2d')
-        text = line.get('text', '')
-        if not isinstance(text, str):
-            text = ''
-        text = text.rstrip()
-
+    def populate_editable_line(
+        self,
+        raw_crop: Image.Image | None,
+        crop_pixmap: QPixmap | None,
+        err: str | None,
+        page_display: str,
+        line_display: str,
+        text: str,
+        multiline: bool,
+        prev_enabled: bool,
+        next_enabled: bool,
+    ) -> None:
         self._err_lbl.clear()
-        self._raw_crop = None
-        self._crop_pixmap = None
+        self._raw_crop = raw_crop
+        self._crop_pixmap = crop_pixmap
         self._crop_label.clear()
-
-        n_pages = len(self._page_images)
-        err: str | None = None
-        # Validate JSON line, then crop the page image; on failure show message and skip pixmap.
-        if not isinstance(page_number, int) or page_number < 1:
-            err = f'Invalid page_number: {page_number!r}'
-        elif page_number > n_pages:
-            err = (
-                f'page_number {page_number} is out of range '
-                f'(chunk has {n_pages} page(s)).'
-            )
-        elif not isinstance(box_2d, list) or len(box_2d) != 4:
-            err = f'Invalid box_2d: {box_2d!r}'
-        else:
-            # ``page_number`` is 1-based in JSON; ``_page_images`` is 0-based.
-            page_img = self._page_images[page_number - 1]
-            w, h = page_img.size
-            left, upper, right, lower = clamp_box_2d_to_pixels(box_2d, w, h)
-            self._raw_crop = page_img.crop((left, upper, right, lower))
-            self._crop_pixmap = pil_to_qpixmap(self._raw_crop)
 
         if err:
             self._err_lbl.setText(err)
 
-        pn = str(page_number) if isinstance(page_number, int) and page_number >= 1 else '—'
-        self._page_lbl.setText(f'Page {pn}')
-        self._line_lbl.setText(f'Line {self._ridx + 1} / {n_review}')
+        self._page_lbl.setText(page_display)
+        self._line_lbl.setText(line_display)
 
-        # Multiline JSON lines use a fixed-height plain editor with a heuristic font only.
-        multiline = '\n' in text
         self._line_edit.blockSignals(True)
         self._plain.blockSignals(True)
         try:
@@ -763,20 +399,15 @@ class ReviewMainWindow(QMainWindow):
             self._line_edit.blockSignals(False)
             self._plain.blockSignals(False)
 
-        self._btn_prev.setEnabled(self._ridx > 0)
-        self._btn_next.setEnabled(self._ridx < n_review - 1)
+        self._btn_prev.setEnabled(prev_enabled)
+        self._btn_next.setEnabled(next_enabled)
 
-        QTimer.singleShot(0, self._apply_crop_scale_and_font)
+        QTimer.singleShot(0, self.apply_crop_scale_and_font)
 
-    def _apply_crop_scale_and_font(self) -> None:
-        """Scale the crop to fit the window, match editor width to the **scaled** image, refit font.
-
-        Called after resize and after showing a new line so ``QLabel`` and ``QLineEdit`` share
-        one column width (visual alignment between bitmap and transcription).
-        """
+    def apply_crop_scale_and_font(self) -> None:
         if self._raw_crop is None or self._crop_pixmap is None or self._crop_pixmap.isNull():
             return
-        max_w = self._max_crop_display_width()
+        max_w = self.max_crop_display_width()
         ow = self._crop_pixmap.width()
         if ow > max_w:
             scaled = self._crop_pixmap.scaledToWidth(
@@ -788,53 +419,184 @@ class ReviewMainWindow(QMainWindow):
         self._crop_label.setPixmap(scaled)
         self._crop_label.setFixedWidth(scaled.width())
 
-        # Same pixel width for crop QLabel and editors so columns align (no independent stretch).
         self._line_edit.setFixedWidth(scaled.width())
         self._plain.setFixedWidth(scaled.width())
         self._editor_stack.setFixedWidth(scaled.width())
         if self._editor_stack.currentIndex() == 0:
-            self._fit_editor_font_only()
+            self.fit_editor_font_only()
 
-    def _fit_editor_font_only(self) -> None:
-        """Recompute single-line font size from the line edit’s current width minus padding fudge."""
+    def fit_editor_font_only(self) -> None:
         if self._editor_stack.currentIndex() != 0:
             return
-        # ~8px margin per side for stylesheet padding + frame; keeps text from touching the border.
         inner = max(80, self._line_edit.width() - 16)
         fit_line_edit_font(self._line_edit, inner)
 
+    def schedule_fit_font(self) -> None:
+        QTimer.singleShot(0, self.fit_editor_font_only)
+
+    def commit_text_from_editors(self) -> str:
+        if self._editor_stack.currentIndex() == 1:
+            return self._plain.toPlainText()
+        return self._line_edit.text()
+
+    def resizeEvent(self, event) -> None:
+        super().resizeEvent(event)
+        QTimer.singleShot(0, self.apply_crop_scale_and_font)
+
+
+class ReviewChunkLinesController:
+    """Connects ``ChunkLinesSession`` to ``ReviewMainWindow`` actions."""
+
+    def __init__(
+        self,
+        session: ChunkLinesSession,
+        view: ReviewMainWindow,
+        raw_json_cli: Path | None,
+    ) -> None:
+        self._session = session
+        self._view = view
+        self._raw_json_cli = raw_json_cli
+        view.connect_controller_signals(self)
+
+    def try_initial_chunk(self) -> None:
+        names = self._view.chunk_pdf_names
+        for name in names:
+            if self._load_chunk(name, show_error=False):
+                self._view.sync_combo_to_chunk_name(
+                    self._session.paths.chunk_name if self._session.paths else None,
+                )
+                return
+        self._view.chunk_combo.setCurrentIndex(0)
+        self._load_chunk(names[0], show_error=True)
+
+    def _on_text_changed(self) -> None:
+        self._session.dirty = True
+        self._view.schedule_fit_font()
+
+    def _sync_combo_to_loaded_chunk(self) -> None:
+        if self._session.paths is None:
+            return
+        self._view.sync_combo_to_chunk_name(self._session.paths.chunk_name)
+
+    def _on_chunk_combo_index_changed(self, index: int) -> None:
+        if index < 0:
+            return
+        name = self._view.chunk_combo.itemText(index)
+        if self._session.paths is not None and name == self._session.paths.chunk_name:
+            return
+        self._switch_to_chunk(name)
+
+    def _switch_to_chunk(self, chunk_name: str) -> None:
+        if self._session.paths is not None and self._session.dirty:
+            box = QMessageBox(self._view)
+            box.setWindowTitle('Unsaved changes')
+            box.setText('You have unsaved edits for this chunk.')
+            box.setInformativeText('Save them before opening another chunk?')
+            box.setStandardButtons(
+                QMessageBox.Save | QMessageBox.Discard | QMessageBox.Cancel,
+            )
+            box.setDefaultButton(QMessageBox.Save)
+            reply = box.exec()
+            if reply == QMessageBox.Cancel:
+                self._sync_combo_to_loaded_chunk()
+                return
+            if reply == QMessageBox.Save:
+                self._commit_current()
+                self._session.save_to_final()
+                self._session.dirty = False
+        if not self._load_chunk(chunk_name, show_error=True):
+            self._sync_combo_to_loaded_chunk()
+
+    def _commit_current(self) -> None:
+        text = self._view.commit_text_from_editors()
+        self._session.commit_editable_text(text)
+
+    def _load_chunk(self, chunk_name: str, show_error: bool) -> bool:
+        err = self._session.load_chunk(
+            self._view.working_dir,
+            chunk_name,
+            self._raw_json_cli,
+        )
+        if err is not None:
+            if show_error:
+                QMessageBox.warning(self._view, 'Cannot load chunk', err)
+            return False
+
+        paths = self._session.paths
+        assert paths is not None
+
+        self._view.setWindowTitle(f'Line review — {paths.chunk_name}')
+        self._view.set_path_labels(paths.raw_path.name, paths.final_path.name)
+        n_skip = len(self._session.lines) - len(self._session.editable_indices)
+        self._view.set_skip_notice_visible(n_skip)
+
+        self._view.set_review_controls_enabled(True)
+        self._show_line()
+        return True
+
+    def _show_line(self) -> None:
+        self._session.clamp_editable_ridx()
+        s = self._session
+        n_editable = len(s.editable_indices)
+        ridx = s.editable_ridx
+        line = s.line_at_editable_ridx()
+        page_number = line.get('page_number')
+        text = line.get('text', '')
+        if not isinstance(text, str):
+            text = ''
+        text = text.rstrip()
+
+        raw_crop, cerr = s.crop_for_current_editable()
+        pixmap = pil_to_qpixmap(raw_crop) if raw_crop is not None else None
+
+        pn = str(page_number) if isinstance(page_number, int) and page_number >= 1 else '—'
+        page_display = f'Page {pn}'
+        line_display = f'Line {ridx + 1} / {n_editable}'
+
+        multiline = '\n' in text
+        self._view.populate_editable_line(
+            raw_crop,
+            pixmap,
+            cerr,
+            page_display,
+            line_display,
+            text,
+            multiline,
+            ridx > 0,
+            ridx < n_editable - 1,
+        )
+
     def _on_prev(self) -> None:
-        """Persist current line, then move to the previous reviewable index."""
-        if self._paths is None or self._ridx <= 0:
+        if not self._session.is_loaded or self._session.editable_ridx <= 0:
             return
         self._commit_current()
-        self._ridx -= 1
+        self._session.editable_ridx -= 1
         self._show_line()
 
     def _on_next(self) -> None:
-        """Persist current line, then move to the next reviewable index."""
-        if self._paths is None or self._ridx >= len(self._review_indices) - 1:
+        s = self._session
+        if not s.is_loaded or s.editable_ridx >= len(s.editable_indices) - 1:
             return
         self._commit_current()
-        self._ridx += 1
+        s.editable_ridx += 1
         self._show_line()
 
     def _on_save(self) -> None:
-        """Flush editor text to payload and write ``*_final.json``."""
-        if self._paths is None:
+        if not self._session.is_loaded:
             return
         self._commit_current()
-        save_payload(self._final_path, self._payload)
-        self._dirty = False
-        self.statusBar().showMessage(f'Wrote {self._final_path}', 6000)
+        paths = self._session.paths
+        assert paths is not None
+        self._session.save_to_final()
+        self._session.dirty = False
+        self._view.statusBar().showMessage(f'Wrote {paths.final_path}', 6000)
 
     def _on_reload(self) -> None:
-        """Optional: re-read raw JSON from disk and reset review state (after confirmation)."""
-        if self._paths is None:
+        if not self._session.is_loaded:
             return
         self._commit_current()
         reply = QMessageBox.question(
-            self,
+            self._view,
             'Reload from raw',
             'Discard edits in memory and reload from raw JSON on disk?',
             QMessageBox.Yes | QMessageBox.No,
@@ -842,22 +604,14 @@ class ReviewMainWindow(QMainWindow):
         )
         if reply != QMessageBox.Yes:
             return
-        # Rebuild from raw file on disk; discards in-memory edits and any ``*_final`` content not saved.
-        self._payload = json.loads(
-            Path(self._source_raw_path).read_text(encoding='utf-8'),
-        )
-        self._lines = self._payload['lines']
-        self._review_indices = reviewable_line_indices(self._lines)
-        if not self._review_indices:
-            QMessageBox.warning(self, 'Reload', 'No reviewable lines after reload.')
+        err = self._session.reload_from_raw_disk()
+        if err is not None:
+            QMessageBox.warning(self._view, 'Reload', err)
             return
-        self._ridx = 0
-        self._dirty = False
         self._show_line()
 
 
 def main() -> int:
-    # Exit codes: 1 = path/validation errors before Qt, 0 = normal Qt exit.
     cli = parse_cli_args()
     working_dir = cli.working_dir.resolve()
     chunk_pdfs_dir = working_dir / 'chunk-pdfs'
@@ -880,19 +634,17 @@ def main() -> int:
     _ic = _review_app_icon()
     if not _ic.isNull():
         app.setWindowIcon(_ic)
-    win = ReviewMainWindow(working_dir, pdf_names, raw_json=cli.raw_json)
+
+    session = ChunkLinesSession()
+    win = ReviewMainWindow(working_dir, pdf_names)
+    ctrl = ReviewChunkLinesController(session, win, raw_json_cli=cli.raw_json)
     win.show()
+    ctrl.try_initial_chunk()
     _install_terminal_interrupt_handlers(app)
     return app.exec()
 
 
 def _install_terminal_interrupt_handlers(app: QApplication) -> None:
-    """Let Ctrl-C in the shell quit the app.
-
-    ``app.exec()`` runs Qt's native event loop; without this, Python often never handles
-    SIGINT, so ``^C`` appears but the process stays running. A periodic no-op timer lets the
-    interpreter run signal handlers on Linux/macOS. ``kill -TERM <pid>`` also exits cleanly.
-    """
     def _quit(_signum=None, _frame=None) -> None:
         app.quit()
 
@@ -904,7 +656,6 @@ def _install_terminal_interrupt_handlers(app: QApplication) -> None:
     timer = QTimer()
     timer.start(200)
     timer.timeout.connect(lambda: None)
-    # Keep reference: if the timer is GC'd, the workaround stops working.
     app._sigint_poll_timer = timer
 
 
