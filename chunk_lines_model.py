@@ -172,6 +172,7 @@ def load_page_images(pdf_path: Path) -> list[Image.Image]:
 
 
 def load_payload(raw_path: Path, final_path: Path) -> dict:
+    # Prefer final when it exists so reopening the chunk loads saved review work, not stale raw.
     if final_path.exists():
         return json.loads(final_path.read_text(encoding='utf-8'))
     return json.loads(raw_path.read_text(encoding='utf-8'))

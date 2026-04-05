@@ -589,6 +589,8 @@ class ReviewChunkLinesController:
         page_display = f'Page {pn}'
         line_display = f'Line {ridx + 1} / {n_editable}'
 
+        # True when this row's text field spans multiple lines: model/JSON edits with
+        # embedded newlines, verse or lists in one box, or wrapped output for a region.
         multiline = '\n' in text
         self._view.populate_editable_line(
             raw_crop,
@@ -689,6 +691,7 @@ def _install_terminal_interrupt_handlers(app: QApplication) -> None:
     if hasattr(signal, 'SIGTERM'):
         signal.signal(signal.SIGTERM, _quit)
 
+    # Wake the event loop periodically so Python can run signal handlers (Ctrl+C works under Qt).
     timer = QTimer()
     timer.start(200)
     timer.timeout.connect(lambda: None)
